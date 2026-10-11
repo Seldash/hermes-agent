@@ -63,6 +63,46 @@ def clear_vault_redaction_values() -> None:
         _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
 
 
+# Values a profile *injects into its own environment* (``.env`` keys won by the profile, external
+# secret backends) are a different threat shape from a vault fill: no tool watches the value being
+# typed, so nothing registers it -- nothing "transits" a boundary the redactor already guards. The
+# command-shape classifier in ``redact_terminal_output`` only recognizes a read of ``.env`` / shell rc
+# / ``config.yaml``, and secrets on record reached model context through shapes it cannot classify:
+# a ``sed`` of a copy of an env dump, a remote config file printed over ``ssh``, a python heredoc.
+# Value-level registration is the command-agnostic boundary instead: ``redact_registered_vault_values``
+# runs on every model-facing redaction, ahead of the ``security.redact_secrets`` preference.
+# The floor exists because the scrub is an exact-substring replace: registering a short identifier a
+# source happens to supply (``NC_ADMIN_USER=hermes``) would rewrite the word everywhere it appears.
+_INJECTED_SECRET_MIN_LEN = 8
+
+
+def register_injected_secret_values(values) -> int:
+    """Register credential-shaped values injected into this profile's environment.
+
+    ``values`` maps env-var name -> effective value (a secret source's applied values, including the
+    ones a pre-existing profile value won, so the winner's bytes are covered too). Only values whose
+    *name* is credential-bearing (``_key_has_secret_keyword``) or whose *shape* is unambiguously
+    opaque (``_looks_like_opaque_credential``) are registered, and never one shorter than
+    ``_INJECTED_SECRET_MIN_LEN``. Returns how many were registered.
+    """
+    if not values:
+        return 0
+    registered = 0
+    for name, value in values.items():
+        try:
+            if not isinstance(name, str) or not isinstance(value, str):
+                continue
+            if len(value) < _INJECTED_SECRET_MIN_LEN:
+                continue
+            if not (_key_has_secret_keyword(name) or _looks_like_opaque_credential(value)):
+                continue
+            register_vault_redaction_value(value)
+            registered += 1
+        except Exception:  # noqa: BLE001 -- registration must never block a caller on startup
+            continue
+    return registered
+
+
 def redact_registered_vault_values(text: str) -> str:
     """Exact-substring scrub of every vault secret value registered for the current profile."""
     if not isinstance(text, str) or not text:

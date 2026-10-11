@@ -629,6 +629,24 @@ def _revoke_secret_source_writes(home_path: Path, *, keep) -> None:
         _SECRET_SOURCE_WRITES_BY_HOME.pop(home_key, None)
 
 
+def _register_source_values_for_redaction(values: "dict[str, str]") -> None:
+    """Register source-supplied secret values with the model-facing redactor.
+
+    Command-shape classification (``agent.redact.redact_terminal_output``) only recognizes a read of
+    ``.env`` / shell rc / ``config.yaml``: a value echoed by a shape it cannot classify -- a copy of an
+    env dump read with ``sed``, a remote config file printed over ``ssh``, a python heredoc -- reached
+    model context verbatim on record. The value registry is command-agnostic and applied on every
+    model-facing redaction, so register what this home injected. Fail-open: a redaction problem must
+    never block startup (same policy as the rest of this module).
+    """
+    try:
+        from agent.redact import register_injected_secret_values
+
+        register_injected_secret_values(values)
+    except Exception:  # noqa: BLE001 -- registration must never block startup
+        return
+
+
 def _apply_external_secret_sources(home_path: Path) -> None:
     """Pull secrets from every enabled external source into env — AFTER dotenv (sources need .env bootstrap
     tokens), BEFORE Hermes reads credentials; failures never block startup. Precedence/conflicts/provenance
@@ -708,6 +726,7 @@ def _apply_external_secret_sources(home_path: Path) -> None:
     _record_secret_source_writes(home_key, report, supplied, environ_before)
     if values:
         _SECRET_SOURCE_VALUES_BY_HOME[home_key] = values
+        _register_source_values_for_redaction(values)
     _SECRET_SOURCE_RESTORE_BY_HOME[home_key] = {
         n: values[n] for n, a in report.provenance.items() if a.authoritative and n in values}
 

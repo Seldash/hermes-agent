@@ -48,7 +48,8 @@ LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
 # 改: ①失败/未知行按时间保留(审计价值最高、体积可忽略 ~8.5 行/天)
 #     ②成功行: 时间下限内全留 + 每个 job 至少保留 EXEC_PER_JOB_KEEP 条 + 全局硬顶 MAX_TERMINAL_EXECUTIONS
 #     ③硬顶序(2026-10-12 待办 846814 修订, 与上游 PR #124830 同语义): 先回收各 job 超出保底的溢出
-#       （最旧优先）, 仅当所有 job 都已在保底内才退回全局最旧兜底; 硬顶仍按 completed 度量
+#       （最旧优先）, 仅当所有 job 都已在保底内才退回全局最旧兜底; 硬顶是**绝对上界**,
+#       度量对象 = 全部终态行（2026-10-19 待办 728654 修口径, 见 _prune_unlocked ③）
 #     ④prune 节流: 未超硬顶时按间隔/累计次数执行(超硬顶立即执行, 保住上游契约测试语义)
 EXEC_SUCCESS_FLOOR_DAYS = float(os.getenv("HERMES_CRON_SUCCESS_FLOOR_DAYS", "7"))
 EXEC_FAILURE_RETENTION_DAYS = float(os.getenv("HERMES_CRON_FAILURE_RETENTION_DAYS", "30"))
@@ -225,10 +226,11 @@ def touch_execution_progress(execution_id: str) -> bool:
 def _prune_unlocked(conn: sqlite3.Connection, *, force: bool = False) -> None:
     """分级保留（2026-09-27 待办 677072）:
 
-    ① failed/unknown: 保留 EXEC_FAILURE_RETENTION_DAYS 天（按时间, 不受配额影响）
+    ① failed/unknown: 保留 EXEC_FAILURE_RETENTION_DAYS 天（按时间），且在硬顶配额内**优先占位**
     ② completed: 时间下限 EXEC_SUCCESS_FLOOR_DAYS 内全留; 超出者每个 job 至少留
-       EXEC_PER_JOB_KEEP 条; 再受全局硬顶 MAX_TERMINAL_EXECUTIONS 约束
+       EXEC_PER_JOB_KEEP 条; 再受全局硬顶 MAX_TERMINAL_EXECUTIONS 约束（只用失败行之外的剩余额度）
     ③ 非终态(claimed/running) 永不删
+    ④ 硬顶度量对象 = 全部终态行（与修剪对象一致；失败行优先、completed 让位，失败行自身超顶才回收）
     节流: 未超硬顶时, 距上次 prune < PRUNE_MIN_INTERVAL_SECONDS 且累计终态写入
     < PRUNE_EVERY_N_FINISHES 则跳过; 超硬顶立即执行。
     """
@@ -270,18 +272,27 @@ def _prune_unlocked(conn: sqlite3.Connection, *, force: bool = False) -> None:
            ) AND COALESCE(finished_at, claimed_at) < ?""",
         (max(0, int(EXEC_PER_JOB_KEEP)), cut_success),
     )
-    # ③ 全局硬顶（安全阀）: 只作用于 completed（失败行不受硬顶影响, 既有契约不变量）。
-    #    先回收各 job 超出保底的溢出（最旧优先）; 仅当所有 job 都已在保底内仍超顶时,
-    #    才退回「全局最旧」兜底（保底让位于硬顶）。
-    #    2026-10-12 待办 846814 / 上游 PR #124830 同语义修订:
-    #      旧实现 = 「全局最旧 OFFSET 硬顶」, 不带 per-job 保底 ⇒ 高频 job 顶到硬顶后,
-    #      低频 job 的行（最老）被整体抹掉（演练: 3 个周级 job 的 200 条保底行实剩 0 条）,
-    #      本模块自述的「每个 job 至少保留 EXEC_PER_JOB_KEEP 条」在硬顶绑定下成为 no-op。
-    #    保留的既有口径: 硬顶按 completed 度量、修剪只动 completed（⑥ 失败/非终态行不变量）。
+    # ③ 全局硬顶（安全阀）: 度量对象 = **全部终态行**（completed+failed+unknown），与修剪对象一致。
+    #    2026-10-19 待办 728654 修口径:
+    #      旧实现 = 超顶判定数「全部终态行」、修剪只删 completed ⇒ completed 逼近硬顶时，
+    #      保留期内的 failed/unknown 把它推过线 → 节流判「超顶 → 立即执行」，每次终态写入都跑
+    #      全表排序删，却始终删不动 → 行数持续超顶（上游 v0.22.2
+    #      tests/cron/test_restart_safe_worker_death_evidence.py 断言 len(list) <= cap 永久红）。
+    #    配额分配: 失败/未知行**优先占配额**（审计价值最高, 常态 ~8.5 行/天），
+    #      completed 只能用剩余额度 cap - 失败行数 ⇒ 硬顶压力下先让 completed 让位，
+    #      而不是把刚写下的失败证据删掉；只有失败行自身就超顶（病态）才回收最旧的失败行。
+    #    保留的既有口径: 硬顶是绝对上界（上游语义）；per-job 保底在硬顶绑定下让位（3b）。
+    #    2026-10-12 待办 846814 / 上游 PR #124830: 先回收各 job 超出保底的溢出（最旧优先），
+    #      仅当所有 job 都已在保底内才退回全局最旧兜底。
+    cap = max(0, int(MAX_TERMINAL_EXECUTIONS))
     completed_total = conn.execute(
         "SELECT COUNT(*) FROM executions WHERE status='completed'"
     ).fetchone()[0]
-    excess = int(completed_total) - max(0, int(MAX_TERMINAL_EXECUTIONS))
+    failure_total = conn.execute(
+        "SELECT COUNT(*) FROM executions WHERE status IN ('failed','unknown')"
+    ).fetchone()[0]
+    completed_target = max(0, cap - min(int(failure_total), cap))
+    excess = int(completed_total) - completed_target
     if excess > 0:
         # 3a 各 job 超保底的 completed 溢出（最旧优先）: 只 shed 必要的量, 不碰别人的保底
         conn.execute(
@@ -297,10 +308,10 @@ def _prune_unlocked(conn: sqlite3.Connection, *, force: bool = False) -> None:
                )""",
             (max(0, int(EXEC_PER_JOB_KEEP)), excess),
         )
-        # 3b 兜底: 所有 job 都已在保底内仍超顶 → 全局最旧的 completed 行（保底让位于硬顶）
+        # 3b 兜底: 所有 job 都已在保底内仍超额 → 全局最旧的 completed 行（保底让位于硬顶）
         still = conn.execute(
             "SELECT COUNT(*) FROM executions WHERE status='completed'"
-        ).fetchone()[0] - max(0, int(MAX_TERMINAL_EXECUTIONS))
+        ).fetchone()[0] - completed_target
         if still > 0:
             conn.execute(
                 """DELETE FROM executions WHERE id IN (
@@ -309,6 +320,16 @@ def _prune_unlocked(conn: sqlite3.Connection, *, force: bool = False) -> None:
                    )""",
                 (int(still),),
             )
+    # 3c 病态兜底: 失败/未知行自身超顶 → 回收最旧的失败行（硬顶是绝对上界, 保留期让位）
+    failure_over = int(failure_total) - cap
+    if failure_over > 0:
+        conn.execute(
+            """DELETE FROM executions WHERE id IN (
+                 SELECT id FROM executions WHERE status IN ('failed','unknown')
+                 ORDER BY COALESCE(finished_at, claimed_at) ASC, id ASC LIMIT ?
+               )""",
+            (int(failure_over),),
+        )
 
 
 def create_execution(

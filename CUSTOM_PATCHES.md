@@ -289,6 +289,27 @@
 - **回归**: `venv/bin/python -m pytest tests/cron/test_execution_ledger.py -q`（上游 25 例）
   + `python3 scripts/tests/test_executions_prune_policy.py`（本策略 14 例）必须全绿。
 - **升级注意**: 上游若吸收，以 git log 比对后优先上游实现；本地补丁可弃。
+- **2026-10-19 扩写（待办 728654 · 修「超顶判定 vs 修剪对象」口径不一致）**:
+  - **病**: `_prune_unlocked` 的超顶判定数**全部终态行**（completed+failed+unknown），修剪却只删
+    completed（失败行仅按 30 天保留期删）⇒ completed 逼近硬顶、保留期内失败行把它推过线时，
+    节流判「超顶 → 立即执行」，于是**每次终态写入都跑一遍全表排序删，却始终删不动**，
+    行数持续超顶（设计意图是未超顶时按 60s / 累计 20 次节流以降写放大）。
+    v0.22.2 新增 `tests/cron/test_restart_safe_worker_death_evidence.py::test_adopted_worker_failure_is_visible`
+    （5 死法 × manual 两臂 = 10 例）断言 `len(list_executions()) <= MAX_TERMINAL_EXECUTIONS`，
+    在本地树上 3<=2 全红 —— 上游契约要求「硬顶是绝对上界」。
+  - **修**: 硬顶语义改为「**度量与修剪同批行**」：硬顶仍按全部终态行度量（跟随上游），
+    但配额分配改为**失败/未知行优先占位**，completed 只能用 `cap - 失败行数` 的剩余额度
+    （先回收 per-job 溢出、再全局最旧兜底）；仅当失败行自身超顶（病态）才按最旧回收失败行。
+    即：正常态失败行仍享 30 天保留；硬顶压力下**先让 completed 让位**，失败证据最后才动。
+    与上游 PR #124830 的方向一致（该 PR 亦把硬顶扩到失败行：同分序 oldest → unknown → failed）。
+  - **不变式保持**: ① claimed/running 永不删 ② 超硬顶时即使未 force 也立即 prune（⑦ 段用例）
+    ③ 失败行 30 天保留（无硬顶压力时）④ per-job 保底（硬顶绑定下让位，同 846814 口径）。
+  - **验证（实测）**: `tests/cron/test_restart_safe_worker_death_evidence.py` 11 passed（修复前 3<=2 红）;
+    `tests/cron/test_execution_ledger.py` 24 passed; `scripts/tests/test_executions_prune_policy.py`
+    17 检查全 PASS（新增 3 组：失败行推过线时未 force 即收敛 / 最新失败行不被误删 /
+    失败行自身超顶才回收）。
+  - **口径变更留痕**: 本地契约测试的 ③/⑤ 判据从「硬顶只作用于 completed（失败行不受影响）」改为
+    「硬顶是绝对上界，失败行优先占配额」（同一轮改测试，避免测试与实现反向漂移）。
 - **上游化 (2026-09-27) → PR #124830**（分支 `fix/cron-execution-ledger-retention`，基线 origin/main
   `79dbb1450e`，worktree `/tmp/pr-p9-executions`，未动 default 生产树）。上游化形态与本地补丁有
   **三处有意差异**，上游合入后本地按上游收敛：

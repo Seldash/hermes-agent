@@ -962,3 +962,30 @@
   supervisor 重新 attach 后重试成功。
 - **上游化状态**: 可上游（daemon 只按名字识别、忽略传入端点属上游行为），但 C3 闸门当前 review_required →
   `PR_INTENT=blocked`，本轮只本地 carry。
+
+### P23. gateway 退出路径 NameError 修复（transcript flush 从未执行）— 2026-10-19 建立（待办 761387）
+
+- **文件**: `tui_gateway/server.py`（新增 `_exit_shutdown_steps()`，`_shutdown_sessions()` 改走它）
+- **来源**: v0.22.2 自身的缺陷，不是移植引入 —— 裸 tag 树同样复现，故属**上游缺陷本地先行修**。
+- **现象**: 进程退出时 `Exception ignored in atexit callback ... NameError: name
+  '_flush_sessions_before_exit' is not defined`（`tui_gateway/server.py:395`）。
+- **根因**: 上游把 teardown 三步写成裸名元组
+  `(_flush_sessions_before_exit, _release_gateway_wake_owner, _stop_turns_before_exit)`，
+  而这三者在 `server.py` 里**从未绑定**：真身分别在 `session_reaper.py:84`、
+  `methods_voice.py:338`、`session_reaper.py:120`，模块级导入只给了别名
+  `session_reaper as _session_reaper` / `methods_voice as _methods_voice`。
+  NameError 发生在**元组构造阶段**，位于 `contextlib.suppress(Exception)` 之外 ⇒ 三步全部跳过：
+  transcript 收尾 flush、gateway wake owner 释放、turn 停止都不执行。后果是每次 gateway 退出
+  （升级、重启、崩溃恢复）都可能丢掉 flush 预算内的会话记录，且只留一条 "Exception ignored" 噪音。
+- **本次改动**: 新增惰性解析器 `_exit_shutdown_steps()`，从 `tui_gateway.session_reaper` /
+  `tui_gateway.methods_voice` 取三个真身，导入失败返回 `()`（退出路径永不因导入失败而炸）；
+  `_shutdown_sessions()` 改为 `for step in _exit_shutdown_steps()`。
+- **不变量**: 不改退出顺序（flush → release → stop），不改 session 关闭逻辑，不改任何 RPC/契约面；
+  解析器只在退出路径调用，不影响运行期导入图（懒导入，规避循环依赖）。
+- **已验**: 以 gateway 同款启动方式（`tools/python-3.14.7* + -I + sys.path.insert(tree) + import hermes_cli.main`）
+  解析出三步全部 callable：
+  `['tui_gateway.session_reaper._flush_sessions_before_exit', 'tui_gateway.methods_voice._release_gateway_wake_owner', 'tui_gateway.session_reaper._stop_turns_before_exit']`；
+  修复前同一路径直接 NameError。
+- **重放验证**: `verify_patches.sh` 的 `P23注入点1`（解析器存在）/ `P23注入点2`（`_shutdown_sessions` 走解析器）/
+  `P23契约`（三步名字仍在 server.py 可见，上游改名即红）
+- **上游化状态**: 可上游（纯 bug fix，无本地语义），下一窗口随补丁集提交 PR。

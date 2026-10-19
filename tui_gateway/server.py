@@ -390,9 +390,27 @@ def _load_interim_assistant_messages() -> bool:
     return is_truthy_value(_display_cfg().get("interim_assistant_messages", True))
 
 
+def _exit_shutdown_steps() -> tuple:
+    """Resolve the teardown steps lazily (P23).
+
+    Upstream v0.22.2 built the tuple from bare names that were never bound in this module
+    (the refactor imports ``session_reaper as _session_reaper`` / ``methods_voice as _methods_voice``),
+    so every exit raised ``NameError`` *during tuple construction* — outside the
+    ``contextlib.suppress`` — and the transcript flush, wake-owner release and turn stop were all
+    skipped. Resolve through the module aliases instead, failing soft so exit never breaks.
+    """
+    try:
+        from tui_gateway import methods_voice as _mv, session_reaper as _sr
+
+        return (_sr._flush_sessions_before_exit, _mv._release_gateway_wake_owner,
+                _sr._stop_turns_before_exit)
+    except Exception:  # pragma: no cover — a broken import must not block exit
+        return ()
+
+
 def _shutdown_sessions() -> None:
     # Durable-first: flush transcripts (bounded budget) BEFORE the slow teardown so a supervisor SIGKILL can't lose them.
-    for step in (_flush_sessions_before_exit, _release_gateway_wake_owner, _stop_turns_before_exit):
+    for step in _exit_shutdown_steps():
         with contextlib.suppress(Exception):
             step()
     with _sessions_lock:

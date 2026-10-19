@@ -273,6 +273,7 @@ def _auto_pause(quota: dict) -> None:
         subprocess.run(
             [sys.executable, tool_script, "--pause", "Bocha"],
             capture_output=True,
+            stdin=subprocess.DEVNULL,
             timeout=10,
         )
     except Exception:

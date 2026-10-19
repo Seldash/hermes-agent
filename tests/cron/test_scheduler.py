@@ -636,15 +636,18 @@ class TestRunJobSessionPersistence:
             mock_agent_cls = entered[-1]  # the AIAgent patch
             yield fake_db, mock_agent_cls
 
-    def test_run_job_memory_enabled_in_cron(self, tmp_path):
-        """Cron agents get memory like any other agent run.
 
-        skip_memory=False and the memory toolset is not policy-denied, so
-        MEMORY.md/USER.md load and the memory tool follows normal toolset
-        resolution.
+    def test_run_job_memory_disabled_in_cron(self, tmp_path):
+        """Cron agents get NO memory — local override (2026-08-23).
+
+        ``skip_memory=True`` and the ``memory`` toolset is policy-denied, so
+        MEMORY.md/USER.md never load into a scheduled run and the memory tool
+        is not offered. Upstream v0.20.5 flipped this to False (ef04d846e);
+        0 of the local fleet's jobs request memory and the exposure /
+        contamination / token cost is not worth it — see cron/scheduler.py.
         """
         job = {
-            "id": "memory-enabled-job",
+            "id": "memory-disabled-job",
             "name": "test",
             "prompt": "hello",
         }
@@ -652,10 +655,32 @@ class TestRunJobSessionPersistence:
             run_job(job)
 
         kwargs = mock_agent_cls.call_args.kwargs
-        assert kwargs["skip_memory"] is False
-        assert "memory" not in (kwargs["disabled_toolsets"] or []), (
-            "memory toolset must not be policy-denied in cron"
+        assert kwargs["skip_memory"] is True
+        assert "memory" in (kwargs["disabled_toolsets"] or []), (
+            "memory toolset must be policy-denied in cron"
         )
+
+    def test_per_job_toolsets_cannot_widen_past_memory_denial(self, tmp_path):
+        """A per-job ``enabled_toolsets`` naming memory cannot re-enable it.
+
+        The per-job allowlist still passes the name through, but the agent
+        applies ``disabled_toolsets`` after it, so the policy denial wins and
+        the run has no persistent memory. Regression guard for the local
+        ``_resolve_cron_disabled_toolsets`` override.
+        """
+        job = {
+            "id": "memory-toolset-job",
+            "name": "test",
+            "prompt": "remember what you learn",
+            "enabled_toolsets": ["memory", "file"],
+        }
+        with self._run_job_patches(tmp_path) as (fake_db, mock_agent_cls):
+            run_job(job)
+
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["skip_memory"] is True
+        assert "file" in (kwargs["enabled_toolsets"] or [])
+        assert "memory" in kwargs["disabled_toolsets"]
 
     def test_tick_skips_due_jobs_while_dispatch_is_paused(self, tmp_path):
         """The drain gate runs before advancing a due job's schedule."""
@@ -1611,9 +1636,11 @@ class TestBuildJobPromptAbsoluteSkillPath:
         (skill_dir / "SKILL.md").write_text("# Alpha\nDo alpha.")
         absolute_path = str(skill_dir)
         seen_names: list[str] = []
+        seen_platform_disabled: list[bool] = []
 
-        def _skill_view(name: str) -> str:
+        def _skill_view(name: str, allow_platform_disabled: bool = False) -> str:
             seen_names.append(name)
+            seen_platform_disabled.append(allow_platform_disabled)
             if name == "alpha-skill":
                 return json.dumps({"success": True, "content": "# Alpha\nDo alpha."})
             return json.dumps({"success": False, "error": f"Skill '{name}' not found."})
@@ -1623,6 +1650,8 @@ class TestBuildJobPromptAbsoluteSkillPath:
             result = _build_job_prompt({"skills": [absolute_path], "prompt": "go"})
 
         assert seen_names == ["alpha-skill"]
+        # P13 (2026-09-13): 显式列出的 cron skill 必须绕过 platform_disabled 过滤
+        assert seen_platform_disabled == [True]
         assert "Do alpha." in result
 
 class TestBuildJobPromptBumpUse:
@@ -1631,7 +1660,7 @@ class TestBuildJobPromptBumpUse:
     def test_bump_use_called_for_loaded_skill(self):
         """bump_use is called for each successfully loaded skill."""
 
-        def _skill_view(name: str) -> str:
+        def _skill_view(name: str, allow_platform_disabled: bool = False) -> str:
             return json.dumps({"success": True, "content": f"Content for {name}."})
 
         with patch("tools.skills_tool.skill_view", side_effect=_skill_view), \

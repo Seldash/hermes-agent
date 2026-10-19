@@ -399,7 +399,10 @@ def _run_claimed_job(job: dict[str, Any], extra_prompt: Optional[str] = None) ->
         # That is NOT a success for the caller — the calling agent relays this result — so report it as
         # failed and surface the delivery error, which lives in last_delivery_error (last_error is None for
         # these runs, and a bare success=False with error=None reads as an unexplained failure). See #83993.
-        ok = last_status in {"ok", "delivery_queued"}
+        # rc 2 (contract alert, SSOT ~/.hermes/scripts/cron_exit_codes.py) means the script ran to
+        # completion and already surfaced what it found — a finished run, not a failure; the alert
+        # text travels in last_error.
+        ok = last_status in {"ok", "alert", "delivery_queued"}
         if execution is not None and execution.get("status") != "completed":
             ok = False
             run_error = execution.get("error") or f"execution ended in {execution.get('status') or 'unknown'} state"

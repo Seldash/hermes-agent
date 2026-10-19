@@ -221,7 +221,11 @@ def _load_cron_skill_parts(job: dict, skill_names: list[str]) -> list[str]:
             continue
 
         try:
-            loaded = json.loads(skill_view(normalize_skill_lookup_name(skill_name)))
+            # P13 (2026-09-13): 显式列出的 cron skill 不受 config `platform_disabled` 过滤 —
+            # 手动 run 从聊天端触发会继承 HERMES_SESSION_PLATFORM, 否则 cron 专用手册被静默跳过
+            # (实证: KB·半导体充实手动补跑 skip kb-enrichment-lite → 作业降级运行)。
+            loaded = json.loads(skill_view(
+                normalize_skill_lookup_name(skill_name), allow_platform_disabled=True))
         except (json.JSONDecodeError, TypeError):
             _skip("skill '%s' returned invalid JSON, skipping", skill_name)
             continue

@@ -187,6 +187,8 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
             patch.object(adapter, "_hydrate_bot_identity", new=AsyncMock()),
             patch.object(adapter, "_build_lark_client", return_value=SimpleNamespace()),
             patch.object(adapter, "_get_sdk_executor", return_value=owned_executor),
+            # P7 carried patch: the WS client is submitted to the adapter-owned WS pool.
+            patch.object(adapter, "_get_ws_executor", return_value=owned_executor),
         ):
             _mock_event_dispatcher_builder(mock_handler_class)
 
@@ -217,7 +219,11 @@ class TestFeishuAdapterMessaging(unittest.TestCase):
                       "FeishuWSClient must receive extra_ua_tags for group @mention delivery")
         self.assertEqual(call_kwargs["extra_ua_tags"], ["channel"],
                          "extra_ua_tags must be ['channel'] to enable group event routing")
-        self.assertEqual(submitted_executors, [owned_executor])
+        # P7 + fake-alive guard carried patches: the WS client AND the
+        # handshake-confirm wait are both submitted, and both must land on the
+        # adapter-owned pool (never asyncio's shared default executor).
+        self.assertTrue(submitted_executors, "expected the WS client to be submitted")
+        self.assertEqual(set(submitted_executors), {owned_executor})
 
     @patch.dict(os.environ, {}, clear=True)
     def test_edit_message_falls_back_to_text_when_post_update_is_rejected(self):

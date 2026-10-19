@@ -33,7 +33,9 @@ def _clean_env(monkeypatch):
     monkeypatch.delenv("BU_NAME", raising=False)
     monkeypatch.delenv("BU_AUTOSPAWN", raising=False)
     monkeypatch.delenv("BROWSER_USE_API_KEY", raising=False)
+    bu_cli._DAEMON_ENDPOINTS.clear()
     yield
+    bu_cli._DAEMON_ENDPOINTS.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -1026,6 +1028,48 @@ class TestBrowserExec:
         assert result["success"] is False
         assert result["exit_code"] == 3
         assert "boom" in result["stderr"]
+
+    def test_unnamed_call_names_daemon_after_browser_session(self, tmp_path, monkeypatch):
+        """The harness daemon is keyed only by BU_NAME and stays alive across calls, so the shared
+        ``default`` daemon used to keep serving whichever browser was resolved first — the CLI then
+        drove browser A while the vault supervisor talked to browser B. Unnamed calls must get a
+        daemon of their own, named after the Hermes browser session they were routed to."""
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        result = json.loads(bu_cli.browser_exec("print(1)", task_id="tsk-a"))
+        expected = bu_cli._daemon_name_for_session(bu_cli._backend_cache_key("tsk-a", ""))
+        assert f"bu:{expected}" in result["output"]
+        assert "bu:default" not in result["output"]
+
+    def test_distinct_browser_sessions_get_distinct_daemons(self, tmp_path, monkeypatch):
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        names = {json.loads(bu_cli.browser_exec("print(1)", task_id=task))["output"].strip()
+                 for task in ("tsk-a", "tsk-b")}
+        assert len(names) == 2
+
+    def test_named_session_keeps_its_own_daemon_name(self, tmp_path, monkeypatch):
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        result = json.loads(bu_cli.browser_exec("print(1)", session="r7k2", task_id="tsk-a"))
+        assert "bu:r7k2" in result["output"]
+
+    def test_endpoint_change_under_live_browser_avoids_stale_daemon(self, tmp_path, monkeypatch):
+        """Route changed mid-session while the previous browser is still up: its relay would
+        happily answer for the new call, so the daemon name must diverge."""
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setattr(bu_cli, "_endpoint_reachable", lambda url: True)
+        endpoints = iter(["http://127.0.0.1:41000", "http://127.0.0.1:42000"])
+
+        def fake_route(env, session, task_id, local):
+            bu_cli._set_cdp_env(env, next(endpoints))
+            return None
+
+        monkeypatch.setattr(bu_cli, "_route_backend", fake_route)
+        first = json.loads(bu_cli.browser_exec("print(1)", task_id="tsk-a"))["output"].strip()
+        second = json.loads(bu_cli.browser_exec("print(1)", task_id="tsk-a"))["output"].strip()
+        assert first != second
 
 
 

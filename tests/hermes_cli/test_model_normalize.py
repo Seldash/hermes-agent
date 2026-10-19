@@ -116,6 +116,32 @@ class TestDeepseekRetiredAliasesAndCustomSlugs:
         assert _normalize_for_deepseek(model) == model
 
 
+# ── DeepSeek 2026-09-10 rename: deepseek-flash (V4.1-Flash) ────────────
+
+class TestDeepseekFlashRename20260910:
+    """``deepseek-flash`` is the official id after the 2026-09-10 rename.
+
+    It must survive normalization untouched. Regression guard: the id has
+    no ``v<digit>`` token, so before it was listed in
+    ``_DEEPSEEK_CANONICAL_MODELS`` the fallback rewrote it back to the
+    legacy ``deepseek-v4-flash`` (verified 2026-09-10).
+    """
+
+    def test_new_official_id_passes_through(self):
+        assert _normalize_for_deepseek("deepseek-flash") == "deepseek-flash"
+
+    def test_new_official_id_via_provider_path(self):
+        assert (
+            normalize_model_for_provider("deepseek-flash", "deepseek")
+            == "deepseek-flash"
+        )
+
+    def test_legacy_v4_flash_still_passes_through(self):
+        assert (
+            _normalize_for_deepseek("deepseek-v4-flash") == "deepseek-v4-flash"
+        )
+
+
 # ── Regression: issue #78796 ───────────────────────────────────────────
 
 class TestIssue78796NvidiaPrefixRepair:

@@ -153,10 +153,17 @@ def _parse_tags(tags_value) -> list[str]:
     return [t.strip().strip("\"'") for t in tags_value.split(",") if t.strip()]
 
 
-def _is_skill_disabled(*names: str, platform: str | None = None) -> bool:
+def _is_skill_disabled(*names: str, platform: str | None = None,
+                       allow_platform_disabled: bool = False) -> bool:
     """Any of *names* disabled in config (one config load)? Platform precedence: explicit arg,
     ``HERMES_PLATFORM``, session ``HERMES_SESSION_PLATFORM``. A globally-disabled skill stays disabled on every platform
-    (keep in sync with agent.skill_utils.get_disabled_skill_names)."""
+    (keep in sync with agent.skill_utils.get_disabled_skill_names).
+
+    P13 (2026-09-13): ``allow_platform_disabled=True`` skips the *platform* tier only —
+    config ``skills.disabled`` still applies. Used by cron jobs that list a skill
+    explicitly: platform_disabled exists to slim interactive routing, but a manual run
+    from chat inherits HERMES_SESSION_PLATFORM and would silently skip a cron-only
+    manual (09-13: KB 半导体充实 manual rerun "could not be found and were skipped")."""
     try:
         from hermes_cli.config import load_config
         skills_cfg = load_config().get("skills", {})
@@ -166,7 +173,9 @@ def _is_skill_disabled(*names: str, platform: str | None = None) -> bool:
                 from gateway.session_context import get_session_env
                 resolved_platform = get_session_env("HERMES_SESSION_PLATFORM") or ""
         platform_disabled = None
-        if resolved_platform:
+        # P13 (local): an explicit-load caller opts out of the platform tier only — config
+        # ``skills.disabled`` still applies (see the docstring above).
+        if resolved_platform and not allow_platform_disabled:
             platform_disabled = cfg_get(skills_cfg, "platform_disabled", resolved_platform)
         disabled = skills_cfg.get("disabled", [])
         return any((platform_disabled is not None and n in platform_disabled) or n in disabled for n in names)
@@ -548,11 +557,14 @@ def _log_security_warnings(name: str, skill_md: Path, content: str, all_dirs, ac
 
 
 def skill_view(
-    name: str, file_path: str | None = None, task_id: str | None = None, preprocess: bool = True) -> str:
+    name: str, file_path: str | None = None, task_id: str | None = None, preprocess: bool = True,
+    allow_platform_disabled: bool = False) -> str:
     """View a skill (SKILL.md) or a file within its directory, as JSON. ``name`` is a skill name
     or path ("axolotl", "03-fine-tuning/axolotl"); "plugin:skill" resolves plugin-provided
     skills. ``preprocess`` applies the configured SKILL.md template / inline shell rendering;
-    slash/preload callers render the message themselves."""
+    slash/preload callers render the message themselves.
+    ``allow_platform_disabled`` (P13): 显式加载场景 (cron 作业列出的 skill) 不受
+    config `platform_disabled` 影响 — 见 `_is_skill_disabled` 文档。"""
     try:
         # Validate before the ':' dispatch so a Windows drive path (C:\skills\foo) can't be
         # reinterpreted as a plugin namespace.
@@ -584,8 +596,10 @@ def skill_view(
         # Disabled by declared name, or by the exact path that IS this copy's load name (a same-tier
         # duplicate's row) — whatever alias reached it; an unrelated copy at that path elsewhere is not.
         rel = _owned_relative(skill_dir, skill_md, all_dirs)
-        if _is_skill_disabled(resolved_name, rel) and (_is_skill_disabled(resolved_name) or any(
-                e["path"] == skill_md and e["load_name"] == rel for e in _skill_catalog(skip_disabled=True, include_hidden=True))):
+        if _is_skill_disabled(resolved_name, rel, allow_platform_disabled=allow_platform_disabled) and (
+                _is_skill_disabled(resolved_name, allow_platform_disabled=allow_platform_disabled) or any(
+                    e["path"] == skill_md and e["load_name"] == rel
+                    for e in _skill_catalog(skip_disabled=True, include_hidden=True))):
             return _fail(f"Skill '{resolved_name}' is disabled. Enable it with `hermes skills` or inspect the files directly on disk.")
         if file_path and skill_dir:
             return _serve_skill_file(

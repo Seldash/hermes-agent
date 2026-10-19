@@ -214,6 +214,10 @@ def _last_run_display(job: dict[str, Any]) -> str:
         return color("ok", Colors.GREEN)
     if last_status == "delivery_queued":
         return color("finished; delivery is still in progress", Colors.YELLOW)
+    if last_status == "alert":
+        # rc 2 (contract SSOT: ~/.hermes/scripts/cron_exit_codes.py): the script ran to
+        # completion and already surfaced what it found — yellow, never the failure line.
+        return color(f"alert: {job.get('last_error') or '?'}", Colors.YELLOW)
     if last_status == "delivery_failed":
         # Agent succeeded but the result never reached the user — not green; last_error is None.
         return color(f"ran, but the result was not delivered ({_short_reason(job.get('last_delivery_error'))}). "
@@ -698,8 +702,19 @@ def _next_run_overdue_issue(next_run: str) -> Optional[str]:
 def _cron_doctor_issues_for_job(job: dict[str, Any]) -> list[str]:
     issues: list[str] = []
     last_status = str(job.get("last_status") or "").strip().lower()
+    if last_status == "alert":
+        # rc 2 = business alert (SSOT cron_exit_codes.py): the run completed and already told
+        # the user — keep it visible, but do not report it as a failed run.
+        issues.append("last run alerted (rc 2, not a failure): "
+                      f"{str(job.get('last_error') or 'unknown alert').strip()}")
+    elif last_status == "unknown":
+        # Written by cron.executions.INTERRUPTED_JOB_STATUS when the attempt's owner died before a
+        # terminal state (gateway restart / kill -9): the run may have done anything, so the job is
+        # not green — and it is not an agent failure either.
+        issues.append("last run was interrupted (owner exited; side effects unknown): "
+                      f"{str(job.get('last_error') or 'unknown').strip()}")
     # "delivery_failed" = the agent run succeeded; the delivery issue below reports it.
-    if last_status and last_status not in {"ok", "delivery_failed", "delivery_queued"}:
+    elif last_status and last_status not in {"ok", "delivery_failed", "delivery_queued"}:
         issues.append(f"last run failed: {str(job.get('last_error') or 'unknown error').strip()}")
     if delivery_err := str(job.get("last_delivery_error") or "").strip():
         issues.append(f"last run finished but the result was not delivered ({_short_reason(delivery_err)}). "

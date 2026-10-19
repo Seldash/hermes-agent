@@ -30,13 +30,37 @@ logger = logging.getLogger(__name__)
 # that temporarily enter another profile cannot leak that profile's records into the import-time
 # home.
 EXECUTIONS_FILE: Optional[Path] = None
-MAX_TERMINAL_EXECUTIONS = 1000
+# 2026-09-09 审计 D3-P1-1 恢复: 运行时 env 覆盖曾于 2026-08-10 落地, 被后续升级覆盖丢失
+# → 保留窗口硬编码回归 1000 行(≈6.5h), interrupted_detector 24h 窗口/长停机恢复失效。
+# .env 与 systemd drop-in 均配 HERMES_CRON_EXECUTIONS_MAX=30000（2026-10-12 实测 .env; 注释旧值 10000 已过期）。
+# import 时读 env → 模块属性: 运行时生效且保留测试 monkeypatch 可注入性(勿改回函数内 getenv)
+MAX_TERMINAL_EXECUTIONS = int(os.getenv("HERMES_CRON_EXECUTIONS_MAX", "1000"))
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 # Floor for the live-owner stale-claim bound (#115692); see _live_owner_stale_after_seconds.
 LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
+
+
+
+# 2026-09-27 待办 677072 分级保留 + prune 节流（本地补丁, 见 CUSTOM_PATCHES.md P9 段的 09-27 扩写）。
+# 病: 旧的「只保留最新 N 条终端行」是**全局配额**——单个分钟级 job(2e3be3f33c61)实测占 40.6%,
+#     把周/月级任务的派发记录一并挤出(10000 行 = 2.86 天, cron_missed_detector 需靠产出文件兜底,
+#     待办 250244 的 30/191 缺口即此)。且每次终态写入都做一次全表排序删(EXPLAIN: TEMP B-TREE)。
+# 改: ①失败/未知行按时间保留(审计价值最高、体积可忽略 ~8.5 行/天)
+#     ②成功行: 时间下限内全留 + 每个 job 至少保留 EXEC_PER_JOB_KEEP 条 + 全局硬顶 MAX_TERMINAL_EXECUTIONS
+#     ③硬顶序(2026-10-12 待办 846814 修订, 与上游 PR #124830 同语义): 先回收各 job 超出保底的溢出
+#       （最旧优先）, 仅当所有 job 都已在保底内才退回全局最旧兜底; 硬顶仍按 completed 度量
+#     ④prune 节流: 未超硬顶时按间隔/累计次数执行(超硬顶立即执行, 保住上游契约测试语义)
+EXEC_SUCCESS_FLOOR_DAYS = float(os.getenv("HERMES_CRON_SUCCESS_FLOOR_DAYS", "7"))
+EXEC_FAILURE_RETENTION_DAYS = float(os.getenv("HERMES_CRON_FAILURE_RETENTION_DAYS", "30"))
+EXEC_PER_JOB_KEEP = int(os.getenv("HERMES_CRON_PER_JOB_KEEP", "200"))
+PRUNE_MIN_INTERVAL_SECONDS = float(os.getenv("HERMES_CRON_PRUNE_MIN_INTERVAL_SECONDS", "60"))
+PRUNE_EVERY_N_FINISHES = int(os.getenv("HERMES_CRON_PRUNE_EVERY_N_FINISHES", "20"))
+# 节流状态（进程内; prune 失败不影响写入）
+_prune_state: Dict[str, float] = {"last": 0.0, "finishes": 0}
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+logger = logging.getLogger(__name__)
 
 
 # --- executions ledger --------------------------------------------------------------------------
@@ -198,16 +222,93 @@ def touch_execution_progress(execution_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def _prune_unlocked(conn: sqlite3.Connection) -> None:
+def _prune_unlocked(conn: sqlite3.Connection, *, force: bool = False) -> None:
+    """分级保留（2026-09-27 待办 677072）:
+
+    ① failed/unknown: 保留 EXEC_FAILURE_RETENTION_DAYS 天（按时间, 不受配额影响）
+    ② completed: 时间下限 EXEC_SUCCESS_FLOOR_DAYS 内全留; 超出者每个 job 至少留
+       EXEC_PER_JOB_KEEP 条; 再受全局硬顶 MAX_TERMINAL_EXECUTIONS 约束
+    ③ 非终态(claimed/running) 永不删
+    节流: 未超硬顶时, 距上次 prune < PRUNE_MIN_INTERVAL_SECONDS 且累计终态写入
+    < PRUNE_EVERY_N_FINISHES 则跳过; 超硬顶立即执行。
+    """
+    from datetime import timedelta
+
+    total = conn.execute(
+        "SELECT COUNT(*) FROM executions "
+        "WHERE status IN ('completed','failed','unknown')"
+    ).fetchone()[0]
+    over_cap = int(total) > max(0, int(MAX_TERMINAL_EXECUTIONS))
+    if not force and not over_cap:
+        _prune_state["finishes"] += 1
+        due = time.monotonic() - _prune_state["last"] >= PRUNE_MIN_INTERVAL_SECONDS
+        if not due and _prune_state["finishes"] < PRUNE_EVERY_N_FINISHES:
+            return
+    _prune_state["last"] = time.monotonic()
+    _prune_state["finishes"] = 0
+
+    now = _hermes_now()
+    cut_success = (now - timedelta(days=EXEC_SUCCESS_FLOOR_DAYS)).isoformat()
+    cut_failure = (now - timedelta(days=EXEC_FAILURE_RETENTION_DAYS)).isoformat()
+
+    # ① 超期失败/未知行
+    conn.execute(
+        """DELETE FROM executions
+           WHERE status IN ('failed','unknown')
+             AND COALESCE(finished_at, claimed_at) < ?""",
+        (cut_failure,),
+    )
+    # ② 成功行: 超时间下限 且 本 job 排名超出保底条数
     conn.execute(
         """DELETE FROM executions WHERE id IN (
-             SELECT id FROM executions
-             WHERE status IN ('completed','failed','unknown')
-             ORDER BY julianday(finished_at) DESC, finished_at DESC,
-                      julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
-           )""",
-        (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
+             SELECT id FROM (
+               SELECT id, ROW_NUMBER() OVER (
+                        PARTITION BY job_id
+                        ORDER BY finished_at DESC, claimed_at DESC, id DESC) AS rn
+               FROM executions WHERE status='completed'
+             ) WHERE rn > ?
+           ) AND COALESCE(finished_at, claimed_at) < ?""",
+        (max(0, int(EXEC_PER_JOB_KEEP)), cut_success),
     )
+    # ③ 全局硬顶（安全阀）: 只作用于 completed（失败行不受硬顶影响, 既有契约不变量）。
+    #    先回收各 job 超出保底的溢出（最旧优先）; 仅当所有 job 都已在保底内仍超顶时,
+    #    才退回「全局最旧」兜底（保底让位于硬顶）。
+    #    2026-10-12 待办 846814 / 上游 PR #124830 同语义修订:
+    #      旧实现 = 「全局最旧 OFFSET 硬顶」, 不带 per-job 保底 ⇒ 高频 job 顶到硬顶后,
+    #      低频 job 的行（最老）被整体抹掉（演练: 3 个周级 job 的 200 条保底行实剩 0 条）,
+    #      本模块自述的「每个 job 至少保留 EXEC_PER_JOB_KEEP 条」在硬顶绑定下成为 no-op。
+    #    保留的既有口径: 硬顶按 completed 度量、修剪只动 completed（⑥ 失败/非终态行不变量）。
+    completed_total = conn.execute(
+        "SELECT COUNT(*) FROM executions WHERE status='completed'"
+    ).fetchone()[0]
+    excess = int(completed_total) - max(0, int(MAX_TERMINAL_EXECUTIONS))
+    if excess > 0:
+        # 3a 各 job 超保底的 completed 溢出（最旧优先）: 只 shed 必要的量, 不碰别人的保底
+        conn.execute(
+            """DELETE FROM executions WHERE id IN (
+                 SELECT id FROM (
+                   SELECT id, ROW_NUMBER() OVER (
+                            PARTITION BY job_id
+                            ORDER BY finished_at DESC, claimed_at DESC, id DESC) AS rn
+                   FROM executions WHERE status='completed'
+                 ) WHERE rn > ?
+                 ORDER BY COALESCE(finished_at, claimed_at) ASC, id ASC
+                 LIMIT ?
+               )""",
+            (max(0, int(EXEC_PER_JOB_KEEP)), excess),
+        )
+        # 3b 兜底: 所有 job 都已在保底内仍超顶 → 全局最旧的 completed 行（保底让位于硬顶）
+        still = conn.execute(
+            "SELECT COUNT(*) FROM executions WHERE status='completed'"
+        ).fetchone()[0] - max(0, int(MAX_TERMINAL_EXECUTIONS))
+        if still > 0:
+            conn.execute(
+                """DELETE FROM executions WHERE id IN (
+                     SELECT id FROM executions WHERE status='completed'
+                     ORDER BY COALESCE(finished_at, claimed_at) ASC, id ASC LIMIT ?
+                   )""",
+                (int(still),),
+            )
 
 
 def create_execution(
@@ -344,6 +445,72 @@ _OWNER_WEDGED_REASON = (
     "treated as wedged (#115692). The process was not terminated; whether side effects "
     "ran is unknown."
 )
+#: Persisted job status for "this attempt ran under an owner that then died". Deliberately NOT
+#: ``error``: nothing is known to have failed, and the stale-error re-arm path
+#: (``cron.jobs._job_is_stale_error_recurring``) must not treat an interrupted attempt as a wedged
+#: failure and shift ``next_run_at`` under a job that is still legitimately scheduled.
+INTERRUPTED_JOB_STATUS = "unknown"
+
+
+def _iso_after(later: Any, earlier: Any) -> bool:
+    """True when both ISO-8601 timestamps parse and *later* is strictly after *earlier*."""
+    try:
+        return datetime.fromisoformat(str(later)) > datetime.fromisoformat(str(earlier))
+    except (TypeError, ValueError):
+        return False
+
+
+def _record_owner_loss(record: Dict[str, Any]) -> None:
+    """Account durably for one attempt whose owner died before a terminal state was written.
+
+    The ledger row alone is near-invisible: without this, ``hermes cron incidents`` carried
+    nothing an operator could acknowledge, and the job kept its PREVIOUS run's ``last_status``
+    (usually ``ok``) until its next fire — so a killed run read as "nothing happened". Two stores
+    are updated, both best-effort: recovery runs inside the gateway tick and must never abort the
+    sweep on a store hiccup.
+
+    * an incident under the same error signature the in-process failure path uses, so an operator
+      ``ack`` (``closed``) suppresses repeat alerts for that loss exactly as for a failed run;
+    * ``last_status='unknown'`` + the reason on the job, so ``hermes cron list`` / doctor report
+      the interrupted attempt instead of the last green one.
+
+    A job that already completed a NEWER attempt keeps its newer status: the loss is recorded for
+    the ledger/incident trail, but not resurrected as the job's current state.
+    """
+    job_id = str(record.get("job_id") or "")
+    if not job_id:
+        return
+    error = str(record.get("error") or _OWNER_GONE_REASON)
+    job: Optional[Dict[str, Any]] = None
+    try:
+        from cron.jobs import get_job
+
+        job = get_job(job_id)
+    except Exception as exc:
+        logger.debug("Job store unreadable while accounting for interrupted %s: %s", job_id, exc)
+    superseded = bool(job) and job.get("last_status") in ("ok", "completed") and _iso_after(
+        job.get("last_run_at"), record.get("started_at") or record.get("claimed_at")
+    )
+    if not superseded:
+        try:
+            from cron.incidents import upsert_incident
+
+            upsert_incident(job_id, error, job_name=(job or {}).get("name"))
+        except Exception as exc:
+            logger.debug("Incident store unavailable for interrupted %s: %s", job_id, exc)
+    if not job or superseded:
+        return
+    try:
+        from cron.jobs import update_job
+
+        update_job(job_id, {
+            "last_status": INTERRUPTED_JOB_STATUS,
+            "last_error": error,
+            "last_interrupted_at": _hermes_now().isoformat(),
+            "last_interrupted_execution": record.get("id"),
+        })
+    except Exception as exc:
+        logger.debug("Could not persist interrupted status for %s: %s", job_id, exc)
 
 
 def settle_unstarted_execution(execution_id: str, job_id: str, error: str) -> None:
@@ -425,6 +592,9 @@ def recover_interrupted_executions() -> int:
             _prune_unlocked(conn)
     for record in recovered:
         _emit_execution_state(record)
+        # Only after the ledger transaction closed: these touch two other stores (incidents,
+        # jobs.json) and must not hold the ledger lock or abort the sweep.
+        _record_owner_loss(record)
     return changed
 
 

@@ -21,15 +21,18 @@ from cron.scheduler import _resolve_cron_disabled_toolsets
 
 # The toolsets that must be denied in cron context no matter what the
 # agent-scheduling gate says: messaging/clarify are interactive-only.
-# ``memory`` is intentionally NOT here — cron agents get memory like any
-# other agent run.
+# ``memory`` is NOT listed here — it is denied by the local override
+# unconditionally (see ``test_memory_denied_by_local_override``), not by
+# the gate itself.
 ALWAYS_DISABLED = ["messaging", "clarify"]
 
 
 class TestGateOffDefault:
     def test_empty_config_denies_cronjob(self):
+        # Local override (patch 0002, CUSTOM_PATCHES.md, 2026-08-23): cron
+        # agents get no ``memory`` toolset, so the expected denylist carries it.
         assert _resolve_cron_disabled_toolsets({}) == [
-            "cronjob", "messaging", "clarify",
+            "cronjob", "messaging", "clarify", "memory",
         ]
 
 
@@ -54,11 +57,12 @@ class TestGateOn:
         for name in ALWAYS_DISABLED:
             assert name in disabled
 
-    def test_memory_not_denied(self):
-        # Cron agents run with memory enabled like any other agent run
-        # (skip_memory=False); the toolset must not be policy-denied.
+    def test_memory_denied_by_local_override(self):
+        # Local override (patch 0002, CUSTOM_PATCHES.md, 2026-08-23): cron
+        # agents run with skip_memory=True, so the ``memory`` toolset is
+        # policy-denied regardless of the agent-scheduling gate.
         for cfg in ({}, {"cron": {"allow_agent_scheduling": True}}):
-            assert "memory" not in _resolve_cron_disabled_toolsets(cfg)
+            assert "memory" in _resolve_cron_disabled_toolsets(cfg)
 
     def test_user_denylist_wins_over_gate(self):
         # A user who denies cronjob in agent.disabled_toolsets keeps it

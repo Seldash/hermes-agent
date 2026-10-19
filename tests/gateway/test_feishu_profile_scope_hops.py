@@ -123,12 +123,22 @@ def test_ws_client_thread_and_its_loop_callbacks_carry_the_adapter_profile_scope
             _ws_thread_loop=None, _ws_reconnect_nonce=None, _ws_reconnect_interval=None,
             _ws_ping_interval=None, _ws_ping_timeout=None, _ws_client=None, _ws_future=None,
             _prepare_client=lambda: "feishu-domain", _hydrate_bot_identity=AsyncMock(),
+            # Fake-alive guard carried patch reads adapter._ws_connected_event;
+            # None keeps this scope test on the single-submit path.
+            _ws_connected_event=None,
         )
         # The WS thread runs on the adapter-owned pool, never the loop default executor.
         stub._get_sdk_executor = fa.FeishuAdapter._get_sdk_executor.__get__(stub)
+        # P7 carried patch: the official-SDK WS client runs on the adapter-owned WS pool.
+        stub._get_ws_executor = fa.FeishuAdapter._get_ws_executor.__get__(stub)
         await fa.FeishuAdapter._connect_websocket(stub)
         await stub._ws_future
-        stub._sdk_executor.shutdown(wait=True)
+        # P7 carried patch: the WS client now runs on the adapter-owned WS pool, so
+        # only the pools actually created during connect() exist on the stub.
+        for pool_attr in ("_sdk_executor", "_ws_executor"):
+            pool = getattr(stub, pool_attr, None)
+            if pool is not None:
+                pool.shutdown(wait=True)
 
     asyncio.run(scenario())
     assert seen == {"ws_thread": ("routed", "routed-value"), "loop_callback": ("routed", "routed-value")}

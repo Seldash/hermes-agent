@@ -963,8 +963,9 @@ def _classify_dispatch_lateness(lateness_seconds: float, grace_seconds: int) -> 
     return "on_time"
 
 
-# Recovery counter for recurring jobs wedged in stale ``last_status == "error"`` with a future
-# next_run_at.
+# Recovery counter for recurring jobs wedged in a stale persisted non-success state
+# (``last_status`` "error" or "alert" — an rc-2 alert is recorded as a non-failure but a job
+# that stopped firing after one is exactly as wedged) with a future next_run_at.
 _persisted_error_recoveries: int = 0
 # Bounded in-memory history kept by every probe-visible fire-path counter.
 _TELEMETRY_RECENT_HISTORY = 20
@@ -975,16 +976,17 @@ def _job_is_stale_error_recurring(
     job: dict[str, Any], schedule: dict[str, Any], now: datetime,
 ) -> bool:
     """True when a recurring job (caller-checked) is wedged in a stale persisted error state:
-    ``last_status == "error"``, not running in this process (never re-arm a live run underneath
-    itself), and ``last_run_at`` older than ``cadence + grace`` (a job merely erroring-and-retrying
-    on schedule stays fresh and is not flagged).
+    ``last_status`` "error" or "alert" ("alert" = rc-2 business alert, recorded as a non-failure
+    but equally wedged when nothing re-fires it), not running in this process (never re-arm a live
+    run underneath itself), and ``last_run_at`` older than ``cadence + grace`` (a job merely
+    erroring-and-retrying on schedule stays fresh and is not flagged).
 
     Condition (all must hold): * it has NOT successfully re-fired within its natural cadence — its
     ``last_run_at`` is older than ``cadence + grace``, so this is not a normal transient-error retry that
     will fire on its own soon, it is a job that has been sitting errored for a full period with no recovery;
     See #62002.
     """
-    if job.get("last_status") != "error":
+    if job.get("last_status") not in ("error", "alert"):
         return False
     from cron.quota_hold import hold_active
     if hold_active(job, now):
@@ -1810,6 +1812,78 @@ def _next_run_or_reject_past_oneshot(
     return next_run_at
 
 
+# 近 30 天新增任务预算（2026-08-25 P3-1 用户批准落地，本地定制）。
+# 与 ~/.hermes/scripts/architecture_compliance_check.py 的 check_cron_growth()
+# 同阈值 20 个/30 天（含一次性任务）。事后检查拦不住创建行为本身
+# （2026-08 连报多日仍新增 94 个），改为创建时即拒绝。
+# 2026-09-17 用户批准放宽 20 → 30（待办 461530 配平后复核）：原触发是「+94/月」的失控增长，
+# 而当时实测近 30 天 24 个全部为系统防线/采集/投研任务（脚本无重复、last_status 全 ok、
+# 零浪费），20 已成为常态建设的硬顶 —— 只能逼出 BYPASS 或砍在役防线。30 保留硬上限
+# （距失控域 3 倍）又不阻断正常建设。
+# 2026-09-25（待办 461346）**口径分层**：计数只算「在役增量」= 常驻 + 未完成的一次性
+# （已完成/已禁用的纯一次性不计）—— 当时实测近 30 天在册 30/30 已满，其中 12 条为跑完的
+# 一次性（churn ≈4 个/日），是把夜批/复核与常驻建设同池计数导致额度被占满。
+# 同口径三面：内核 jobs.py（本文件）+ scripts/cron_budget_scope.py（脚本侧唯一实现，
+# cron_governance_weekly / architecture_compliance_check 均 import 它）+ 上述两处消费端；
+# 阈值与口径断言见 scripts/verify_patches.sh 的 P4 段与 scripts/patch_manifest.py 的 P4 项。
+_CRON_GROWTH_LIMIT_DEFAULT = 30
+
+
+def is_active_increment(job: Dict[str, Any]) -> bool:
+    """近 30 天「在役增量」判定（口径分层 2026-09-25 待办 461346；在役对齐 2026-10-16）。
+
+    在役 = 仍占用调度资源 = is_job_runnable()（enabled 且无暂停标记），**常驻与一次性同一判定**：
+    已完成/已取消/已禁用的一次性（复核、夜批、一次性核验跑完即 _complete_job_record 置
+    enabled=False + state=completed）不再占预算名额；停用/暂停的常驻同样不占 ——
+    2026-10-16 之前对常驻只问「是不是常驻」、不看 enabled，于是停用不腾额度、只剩「删除」
+    一条释放路径（与「防线该停用不该删」相冲）。脚本侧同一判定见
+    ``~/.hermes/scripts/cron_budget_scope.py``，两处口径由
+    ``scripts/tests/test_cron_budget_scope.py`` 的契约测试守住（同一数据必须同计数）。
+    """
+    return is_job_runnable(job)
+
+
+def _check_job_growth_budget(label: str) -> None:
+    """拒绝超预算的 cron 创建：近 30 天「在役增量」>= 上限即抛 ValueError。
+
+    统计口径与每日合规检查一致：现存 jobs.json 中 created_at 落在近 30 天窗口内、
+    且**仍在役**（enabled 且未暂停）的任务 —— 常驻与一次性同一判定；停用常驻、跑完/禁用
+    的一次性都会立即降计数（删除同样降计数）。
+    紧急通道：HERMES_CRON_BUDGET_BYPASS=1 跳过（运维明确批准时用，默认不设）；
+    HERMES_CRON_BUDGET_LIMIT 可覆盖阈值（测试/调参用）。
+    jobs.json 读取失败时保守放行（由每日 08:30 合规检查兜底）。
+    """
+    if os.environ.get("HERMES_CRON_BUDGET_BYPASS") == "1":
+        return
+    try:
+        jobs = load_jobs()
+    except Exception:
+        return
+    limit = _CRON_GROWTH_LIMIT_DEFAULT
+    try:
+        limit = int(os.environ.get("HERMES_CRON_BUDGET_LIMIT", "") or limit)
+    except ValueError:
+        pass
+    cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    in_window = [
+        j for j in jobs
+        if (j.get("created_at") or "")[:10] and (j.get("created_at") or "")[:10] >= cutoff
+    ]
+    new_jobs = [j for j in in_window if is_active_increment(j)]
+    if len(new_jobs) >= limit:
+        recent = "、".join(
+            f"{j.get('created_at', '')[:10]} {j.get('name', '?')}"
+            for j in sorted(new_jobs, key=lambda x: x.get("created_at", ""))[-8:]
+        )
+        raise ValueError(
+            f"cron 增量拦截: 近30天在役增量 {len(new_jobs)} 个(上限 {limit}，"
+            f"口径=在役（enabled 且未暂停）；停用常驻与已跑完/已禁用的一次性不计)，"
+            f"拒绝创建「{label}」。新增前先评估合并/复用现有任务，或停用/删除不再需要的任务配平；"
+            f"紧急场景可设 HERMES_CRON_BUDGET_BYPASS=1 跳过本拦截。"
+            f"在役增量示例: {recent}"
+        )
+
+
 def create_job(
     prompt: Optional[str],
     schedule: str,
@@ -1885,6 +1959,10 @@ def create_job(
         or (f["script"] if f["no_agent"] else None)
         or "cron job"
     )
+
+    # 近30天增量预算拦截（P3-1，2026-08-25 用户批准）：超限拒绝创建，
+    # 倒逼"先合并/复用再新增"。紧急通道 HERMES_CRON_BUDGET_BYPASS=1。
+    _check_job_growth_budget(label_source[:50].strip())
     name = name or label_source[:50].strip()
     if pinned and not f["model"]:
         f["provider"], f["model"] = _main_model_pin()
@@ -2359,6 +2437,52 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
     return _with_job(job_id, apply, False)
 
 
+#: Exit code meaning "business alert", not an execution failure. Contract SSOT:
+#: ``~/.hermes/scripts/cron_exit_codes.py`` (EXIT_ALERT = 2) — the script ran to completion and
+#: already reported what it found, so a run that ended this way must not read as a failure.
+ALERT_EXIT_CODE = 2
+
+#: The scheduler's authoritative script-error header shapes ("Script exited with code 2" /
+#: "脚本退出码 2"), from tests to the real writer in cron/scheduler_script.py.
+_SCRIPT_EXIT_CODE_RE = re.compile(
+    r"(?:script exited with code|退出码)\s*[:：]?\s*(-?\d+)", re.IGNORECASE)
+
+
+def script_exit_code(error: Optional[str]) -> Optional[int]:
+    """Exit code carried by a scheduler-written script-error text, else None.
+
+    Only the authoritative header shapes are trusted (first 3 lines), mirroring
+    ``cron_exit_codes.parse_exit_code``: a loose full-text search happily matches a child
+    process's "exit=0" inside stdout, which would let a real failure read as an alert.
+    Unknown / unparseable → None (caller falls back to failure, the fail-safe direction).
+    """
+    if not isinstance(error, str) or not error.strip():
+        return None
+    head = "\n".join(error.splitlines()[:3])
+    match = _SCRIPT_EXIT_CODE_RE.search(head)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def _derived_last_status(
+    success: bool, error: Optional[str], delivery_error: Optional[str],
+) -> str:
+    """``last_status`` for a finished run: ``ok`` | ``alert`` | ``error`` | ``delivery_failed``.
+
+    ``alert`` is the contract's third state: rc 2 (EXIT_ALERT) means the script completed and
+    surfaced its finding, so persisting it as a state of its own keeps consumers from having to
+    re-derive "failure vs alert" out of the error text on every read.
+    """
+    if success:
+        return "delivery_failed" if isinstance(
+            delivery_error, str) and delivery_error.strip() else "ok"
+    return "alert" if script_exit_code(error) == ALERT_EXIT_CODE else "error"
+
+
 def _record_run_outcome(
     job: dict[str, Any], success: bool, error: Optional[str], delivery_error: Optional[str],
     status: Optional[str], now: str,
@@ -2369,14 +2493,20 @@ def _record_run_outcome(
     # The transient manual-run context is single-fire: the run that just completed consumed it.
     job.pop("manual_run_prompt", None)
     delivery_failed = isinstance(delivery_error, str) and bool(delivery_error.strip())
-    job["last_status"] = status or (
-        "error" if not success else ("delivery_failed" if delivery_failed else "ok"))
+    job["last_status"] = status or _derived_last_status(success, error, delivery_error)
     job["last_error"] = None if success else error
     if success:
         # Healthy run: drop the alert-once dedup markers so a FUTURE break re-alerts, and clear
         # the forward-failure stamp so it only describes CURRENT auto-fire health.
         job.pop("preflight_alerted", None)
         job.pop("last_fire_error", None)
+        job["failure_streak"] = 0
+    elif job["last_status"] == "alert":
+        # rc 2 business alert: the script ran to completion and already told the user what it
+        # found, so this run is NOT an execution failure and must not accrue the streak that
+        # fires the "failed N runs" nudge (scheduler._failure_streak_nudge). It is not a clean
+        # run either — the alert-once dedup markers above stay untouched. ``last_error`` keeps
+        # the alert text for the consumers that single-list alerts.
         job["failure_streak"] = 0
     else:
         # Consecutive agent-failure streak; delivery failures do NOT count

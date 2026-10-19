@@ -1883,7 +1883,9 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         # before cleanup runs.
         # ``timeout`` is already the effective (launchd-capped) drain, so this is the same
         # leash the thread watchdog is armed with — dump margin included.
-        _cron_leash = effective_stop_watchdog_delay(self, resolve_shutdown_watchdog_delay(timeout))
+        # P6: the leash must ALSO cover the cron drain floor, else it hard-exits (os._exit)
+        # before an in-flight cron job can finish (2026-09-03 KB·半导体充实 79fafef419b5).
+        _cron_leash = effective_stop_watchdog_delay(self, resolve_shutdown_watchdog_delay(max(timeout, _cron_drain_cfg)))
         _cron_timeout = resolve_cron_drain_budget(
             timeout, _cron_drain_cfg, watchdog_delay=_cron_leash, elapsed=ctx.elapsed(),
         )
@@ -2198,7 +2200,14 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             "restart_drain_timeout": self._restart_drain_timeout,
             "effective_drain_timeout": effective_stop_drain_timeout(self),
             "launchd_exit_timeout_s": getattr(self, "_launchd_exit_timeout_s", None),
-            "watchdog_delay_s": _effective_watchdog_leash(self),
+            # P6: leash covers the cron drain floor too (bare shutdown-path doubles lack the attr);
+            # still wrapped in the launchd-capped effective leash, as upstream's snapshot was.
+            "watchdog_delay_s": effective_stop_watchdog_delay(self, resolve_shutdown_watchdog_delay(
+                max(
+                    self._restart_drain_timeout,
+                    getattr(self, "_cron_drain_timeout", DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT),
+                )
+            )),
             "phase_elapsed_s": ctx.elapsed() if ctx.started_at is not None else None,
         }
 
@@ -2217,8 +2226,16 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             deferred_count=getattr(self, "_active_deferred_agent_worker_count", lambda: 0)
         )
         if not os.environ.get("PYTEST_CURRENT_TEST"):
+            # P6: watchdog leash must cover the cron drain floor (see _stop_drain_active_work);
+            # otherwise a >restart_drain_timeout in-flight cron job is SIGKILLed at the leash.
             arm_shutdown_watchdog(
-                _effective_watchdog_leash(self), done_event=_watchdog_done,
+                effective_stop_watchdog_delay(self, resolve_shutdown_watchdog_delay(
+                    max(
+                        self._restart_drain_timeout,
+                        getattr(self, "_cron_drain_timeout", DEFAULT_GATEWAY_CRON_DRAIN_TIMEOUT),
+                    )
+                )),
+                done_event=_watchdog_done,
                 snapshot_fn=lambda: GatewayRunner._shutdown_watchdog_snapshot(self, ctx), exit_code=1,
             )
         try:

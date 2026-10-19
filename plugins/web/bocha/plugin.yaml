@@ -1,0 +1,7 @@
+name: web-bocha
+version: 1.0.0
+description: "Bocha AI Search (博查) — Chinese-native multi-source search with AI summaries. Baidu/Sogou/360/Bing/WeChat/News aggregation. Requires BOCHA_API_KEY in ~/.hermes/.env."
+author: Hermes (adapter from bocha_search.py)
+kind: backend
+provides_web_providers:
+  - bocha

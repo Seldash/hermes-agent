@@ -273,11 +273,93 @@ def _discovery_entry(lineage_root: Optional[str], **fields) -> dict[str, Any]:
     return entry
 
 
-def _title_match_result(db, query: str, current_lineage_root: Optional[str]) -> Optional[dict[str, Any]]:
+def _escape_like(text: str) -> str:
+    """Escape LIKE wildcards so user input matches literally."""
+    return (
+        text.replace("\\", "\\\\")
+        .replace("%", "\\%")
+        .replace("_", "\\_")
+    )
+
+
+def _fuzzy_resolve_title(db, title_query: str) -> Optional[tuple]:
+    """LIKE 兜底标题解析 — 精确标题匹配失败时启用。
+
+    Returns ``(session_id, title)`` or ``None``.
+
+    触发门槛（防过宽误匹配）：
+      - 查询含 CJK：总长 >=3 字符
+      - 纯 ASCII：总长 >=4 字符
+
+    两段式匹配（由精确到宽）：
+      1. 连续子串 —— '待办事项' → 标题含 '待办事项'（如 '查看剩余待办事项 #4'）
+      2. CJK 2-gram AND —— 连续子串失败后，把 >=4 字的 CJK 段按步长 2
+         切成 2-gram（'查看待办' → ['查看','待办']），要求标题同时含全部
+         gram（'查看剩余待办事项' 命中）。兜住用户凭记忆片段搜标题的场景。
+
+    取最新匹配（last_activity_at / started_at 倒序）。
+    """
+    cjk_chars = sum(1 for ch in title_query if "\u4e00" <= ch <= "\u9fff")
+    if cjk_chars and len(title_query) < 3:
+        return None
+    if not cjk_chars and len(title_query) < 4:
+        return None
+
+    # 模式 1：连续子串
+    patterns: List[Any] = [title_query]
+
+    # 模式 2：CJK 2-gram AND（仅当存在 >=4 字的连续 CJK 段）
+    if cjk_chars >= 4:
+        grams: List[str] = []
+        for run in re.findall(r"[\u4e00-\u9fff]+", title_query):
+            if len(run) >= 4:
+                grams.extend(run[i : i + 2] for i in range(0, len(run) - 1, 2))
+        if len(grams) >= 2:
+            patterns.append(grams)
+
+    for pat in patterns:
+        if isinstance(pat, str):
+            like_sql = "s.title LIKE ? ESCAPE '\\'"
+            params: List[Any] = [f"%{_escape_like(pat)}%"]
+        else:
+            clauses = ["s.title LIKE ? ESCAPE '\\'"] * len(pat)
+            params = [f"%{_escape_like(g)}%" for g in pat]
+            like_sql = " AND ".join(clauses)
+        try:
+            with db._lock:
+                row = db._conn.execute(
+                    f"""
+                    SELECT s.id, s.title
+                    FROM sessions s
+                    WHERE {like_sql}
+                      AND s.archived = 0
+                    ORDER BY COALESCE(s.last_activity_at, s.started_at) DESC
+                    LIMIT 1
+                    """,
+                    params,
+                ).fetchone()
+        except Exception as exc:
+            logging.debug("fuzzy title resolve failed for %r: %s", title_query, exc)
+            return None
+        if row:
+            return row[0], row[1]
+    return None
+
+
+def _title_match_result(db, query: str, current_lineage_root: Optional[str],
+                         allow_fuzzy: bool = True) -> Optional[Dict[str, Any]]:
     """Discovery-shaped result when the query matches a session title, else None."""
     title_query = query.strip().strip("`'\"")  # models often quote a remembered title
     session_id = title_query and _quiet(lambda: db.resolve_session_by_title(title_query), None,
                                         "resolve_session_by_title failed for %r", title_query)
+    # 本地补丁：精确标题未命中时的 LIKE 兜底（CJK 2-gram AND）；sort 显式时由调用方关闭。
+    fuzzy = False
+    if not session_id:
+        if not allow_fuzzy:
+            return None
+        resolved = _fuzzy_resolve_title(db, title_query)
+        session_id, _matched_title = resolved if resolved else (None, None)
+        fuzzy = bool(session_id)
     if not session_id:
         return None
     lineage_root = _resolve_lineage(db, session_id)
@@ -302,8 +384,9 @@ def _title_match_result(db, query: str, current_lineage_root: Optional[str]) -> 
     return {**_discovery_entry(
         lineage_root, session_id=session_id, when=_format_timestamp(session_meta.get("started_at")),
         source=session_meta.get("source", "unknown"), model=session_meta.get("model") or "unknown",
-        title=title, matched_role="session_title", match_message_id=anchor_id,
-        snippet=f"Session title matched: {title}",
+        title=title, matched_role="session_title_fuzzy" if fuzzy else "session_title", match_message_id=anchor_id,
+        snippet=(f"Session title matched: {title}" if not fuzzy
+                 else f"Session title fuzzy-matched: {title}"),
         bookend_start=shape("bookend_start", messages[:3]),
         messages=shape("window", messages[:5], anchor_id, max_content_len=4000),
         bookend_end=shape("bookend_end", messages[-3:]), messages_before=view.get("messages_before", 0),
@@ -313,7 +396,12 @@ def _title_match_result(db, query: str, current_lineage_root: Optional[str]) -> 
 
 def _discover_payload(db, query: str, detail: str, results: list, **extra) -> str:
     """Discovery response; notes FTS backfill progress so the agent can explain thin
-    results instead of treating them as ground truth."""
+    results instead of treating them as ground truth.
+
+    Coverage metrics (see session-search-diagnosis-20260918.md, option B): use
+    ``lineages_matched`` / ``raw_rows_scanned`` / ``scan_window_truncated``. The old
+    ``sessions_searched`` was a count of distinct lineage roots in the RETURNED slice — never above
+    ``limit`` — and read as "how many sessions were searched". """
     status = _quiet(db.fts_rebuild_status, None, "fts_rebuild_status failed")
     rebuild = {} if status is None else {"index_rebuild": {"percent": status["percent"], "note": (
         f"The search index is rebuilding in the background ({status['percent']}% done, "
@@ -358,7 +446,10 @@ def _discover(db, query: str, role_filter: Optional[list[str]], limit: int, sort
     """Discovery shape: FTS5 plus adaptive or full result hydration."""
     current_lineage_root = _resolve_lineage(db, current_session_id) if current_session_id else None
     excluded_roots = _excluded_lineage_roots(db, exclude_session_ids or [])
-    title_result = _title_match_result(db, query, current_lineage_root)
+    # 显式时间排序时禁用模糊标题匹配——fuzzy 恒取最新会话，会违背 oldest/newest 语义
+    title_result = _title_match_result(
+        db, query, current_lineage_root, allow_fuzzy=(sort is None)
+    )
     # FTS rows are time-bounded in SQL (_search_filter_clauses); the title match bypasses that
     # query, so it is the one place the window is re-checked in Python.
     if title_result:
@@ -378,23 +469,39 @@ def _discover(db, query: str, role_filter: Optional[list[str]], limit: int, sort
     raw_results = sorted(raw_results, key=lambda r: (r.get("source") or "") in _DEMOTED_SESSION_SOURCES)
     # See #19434.
     if not raw_results and not title_result:
-        return _discover_payload(db, query, detail, [], message=(
+        return _discover_payload(db, query, detail, [], lineages_matched=0, raw_rows_scanned=0,
+                                 scan_window_truncated=False, message=(
             "No matching sessions found. FTS5 ANDs all terms by default — "
             "broaden with OR (`alpha OR beta`), exact-match with quoted "
             "phrases, exclude with NOT, or prefix-match with `deploy*`."))
     seen_sessions: dict[str, dict[str, Any]] = {}
     results = [title_result] if title_result else []
+    # Every distinct lineage that matched anywhere in the scan window — deliberately NOT capped by
+    # `limit`. The old `sessions_searched` was len(seen_sessions), and the loop broke at `limit`, so
+    # it could never exceed `limit` (default 3): readers took it as "how many sessions were searched"
+    # when it only ever described the returned slice. See session-search-diagnosis-20260918.md (option B).
+    matched_lineages: set = set()
     if title_result and (title_lineage := title_result.pop("_lineage_root", None)):
         seen_sessions[title_lineage] = {"_title_only": True}
+        matched_lineages.add(title_lineage)
     # Dedupe by lineage (lineage_root -> first surviving FTS row) up to `limit`. The raw
     # owning session_id stays on the row — only it pairs validly with the FTS match id.
     # Current-lineage hits are skipped UNLESS the transcript left live context
     # (compression-ended, /new-reset predecessor, or an in-place compacted row on the
     # SAME session); a live delegation child (end_reason=None) stays excluded.
+    # The window is walked in FULL (no break at `limit`) so the returned metrics describe the match
+    # set rather than the returned slice; lineage resolution is memoised per session_id — the raw
+    # window is dominated by a few high-volume sessions, so re-walking each parent chain per row is
+    # the only real cost (measured 1.6s unmemoised vs 24ms memoised on a 300-row window).
+    lineage_cache: Dict[str, str] = {}
+
+    def _lineage_of(session_id: str) -> str:
+        if session_id not in lineage_cache:
+            lineage_cache[session_id] = _resolve_lineage(db, session_id)
+        return lineage_cache[session_id]
+
     for r in raw_results:
-        if len(seen_sessions) >= limit:
-            break
-        raw_sid, resolved_sid = r["session_id"], _resolve_lineage(db, r["session_id"])
+        raw_sid, resolved_sid = r["session_id"], _lineage_of(r["session_id"])
         if raw_sid in excluded_roots or resolved_sid in excluded_roots:
             continue
         # Skip the current session lineage — UNLESS the hit's transcript has left live context. Three
@@ -413,7 +520,9 @@ def _discover(db, query: str, role_filter: Optional[list[str]], limit: int, sort
             continue
         if current_session_id and raw_sid == current_session_id and not is_compacted_hit:
             continue
-        seen_sessions.setdefault(resolved_sid, {**r, "_lineage_root": resolved_sid})
+        matched_lineages.add(resolved_sid)
+        if len(seen_sessions) < limit:
+            seen_sessions.setdefault(resolved_sid, {**r, "_lineage_root": resolved_sid})
     for lineage_root, match_info in seen_sessions.items():
         if match_info.get("_title_only"):
             continue
@@ -423,7 +532,18 @@ def _discover(db, query: str, role_filter: Optional[list[str]], limit: int, sort
             results.append(entry)
     for entry in results:
         entry["link"] = _session_link(entry["session_id"], link_profile)
-    return _discover_payload(db, query, detail, results, sessions_searched=len(seen_sessions), link_hint=(
+    # Real coverage metrics (option B of session-search-diagnosis-20260918.md): how many distinct
+    # lineages the query matched inside the scan window, how many raw rows that took, and whether the
+    # window itself was saturated — the last one is the only signal that the match set was cut off.
+    window_full = len(raw_results) >= _DISCOVER_SCAN_LIMIT
+    extra = {} if not window_full else {"coverage_note": (
+        f"This query matched at least {_DISCOVER_SCAN_LIMIT} raw message rows ({_DISCOVER_SCAN_LIMIT}-row "
+        "scan window is full) — only the top-ranked slice of the match set is represented here and "
+        "lineages_matched counts within that window. Narrow the query, name fewer / more specific "
+        "terms, or search keywords one at a time to see the rest.")}
+    return _discover_payload(
+        db, query, detail, results, lineages_matched=len(matched_lineages),
+        raw_rows_scanned=len(raw_results), scan_window_truncated=window_full, **extra, link_hint=(
         "When referring the user to a session, write its `link` value "
         "verbatim inline mid-sentence (it renders as a titled link) — never "
         "as markdown, in backticks, on its own line, or next to the "

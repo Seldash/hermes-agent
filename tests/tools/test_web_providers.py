@@ -170,6 +170,16 @@ class TestUnconfiguredErrorEnvelopeParity:
         ):
             monkeypatch.delenv(k, raising=False)
 
+        # Local addition (patch P8, CUSTOM_PATCHES.md): the bundled Bocha
+        # plugin loads BOCHA_API_KEY straight from ``~/.hermes/.env`` instead
+        # of os.environ, so deleting env vars alone does not simulate a
+        # zero-credential install on a machine with a real .env file.
+        try:
+            from plugins.web.bocha import provider as _bocha_provider
+        except ImportError:  # plugin not bundled in this tree
+            return
+        monkeypatch.setattr(_bocha_provider, "_load_api_key", lambda: None)
+
     def test_unconfigured_search_emits_top_level_error(self, monkeypatch):
         """``web_search_tool`` with no creds returns ``{"error": "Error searching web: ..."}``
         — matching main's ``tool_error()`` envelope, not a per-result shape.

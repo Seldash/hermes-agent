@@ -136,6 +136,26 @@ def inactivity_notice(job_name: str, job_id: str) -> str:
     )
 
 
+def business_alert_notice(job_name: str, job_id: str, cleaned_text: str) -> str:
+    """Notice for a run that ended with the business-alert exit code (rc=2 / ``EXIT_ALERT``).
+
+    The script ran to completion and already reported what it found (``scripts/cron_exit_codes.py``
+    contract), so this is NOT a failure: forward the finding and say so. Sending the failure notice
+    here would point the operator at a healthy job — the exact confusion the exit-code contract
+    exists to remove.
+    """
+    text = " ".join(str(cleaned_text or "").split()).rstrip(".")
+    lead = (
+        f"🔔 Cron '{job_name}' reported a business alert: {text}."
+        if text else
+        f"🔔 Cron '{job_name}' reported a business alert (see its output)."
+    )
+    return (
+        f"{lead} It ran to completion — nothing failed and nothing needs fixing here. "
+        f"Details: `hermes cron runs {job_id}` (output saved under {cron_output_dir_display(job_id)})."
+    )
+
+
 def blocked_config_notice(job_name: str, reason: str) -> str:
     """One-time notice when the pre-run configuration check refused to start the job."""
     reason = reason.rstrip()

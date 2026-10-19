@@ -5,6 +5,7 @@ instead of default browser tools
 """
 
 import contextlib
+import hashlib
 import importlib
 import importlib.util
 import json
@@ -12,6 +13,7 @@ import logging
 import os
 import re
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -82,6 +84,8 @@ _MAX_TIMEOUT_S = 1800
 _STDERR_CAP_CHARS = 4000
 
 _TASK_ID_SAFE_RE = re.compile(r"[^A-Za-z0-9._-]+")  # filesystem-safe task ids
+# Daemon name → CDP endpoint it was last dispatched against (process-local; see browser_exec).
+_DAEMON_ENDPOINTS: Dict[str, str] = {}
 # Screenshot paths printed by capture_screenshot(): POSIX or Windows drive-letter absolute.
 _IMAGE_PATH_RE = re.compile(r"((?:[A-Za-z]:[\\/]|/)[^\s\"']+?\.(?:png|jpe?g|webp))", re.IGNORECASE)
 # http(s) URL literals in exec code checked against browser_navigate's policy
@@ -120,6 +124,41 @@ def _set_cdp_env(env: dict, cdp: str) -> None:
 
 def _has_cdp_env(env: dict) -> bool:
     return bool(env.get("BU_CDP_WS") or env.get("BU_CDP_URL"))
+
+
+def _daemon_name_for_session(key: str) -> str:
+    """``BU_NAME`` of the CLI daemon that owns the browser session ``key``.
+
+    The harness daemon is a long-lived CDP relay keyed ONLY by ``BU_NAME``: its
+    ``ensure_daemon`` early-returns as soon as the named daemon answers ``Target.getTargets``,
+    so whichever daemon was started first on a name keeps serving every later call and the
+    ``BU_CDP_URL``/``BU_CDP_WS`` we just resolved is silently ignored. Unnamed ``browser_exec``
+    calls used to share the harness's ``default`` daemon, i.e. whichever browser happened to be
+    resolved first — the CLI drove browser A while the vault supervisor attached to browser B,
+    and every origin read landed on ``about:blank`` ("Could not determine the current page
+    origin", ``browser_vault_save_login`` "Open the site's login page first").
+
+    One daemon per Hermes browser session (the same key that owns the browser) makes the relay
+    and the browser 1:1: a stale daemon can no longer answer for another browser, and when the
+    packaged Chromium is reaped and comes back on a new port the daemon self-heals through
+    ``ensure_daemon``'s restart path using the fresh endpoint.
+    """
+    return "hx-" + hashlib.sha1(str(key).strip().lower().encode("utf-8")).hexdigest()[:12]
+
+
+def _endpoint_reachable(cdp: str) -> bool:
+    """Best-effort liveness probe for a CDP endpoint: does its debug port still answer?"""
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(cdp)
+        host, port = parsed.hostname, parsed.port or (443 if parsed.scheme == "https" else 80)
+        if not host or not port:
+            return False
+        with socket.create_connection((host, port), timeout=0.4):
+            return True
+    except OSError:
+        return False
 
 
 def _export_session_cdp(env: dict, get_session_info: Callable[[str], Any], cache_key: str,
@@ -725,6 +764,23 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     if local_sidecar:
         env["BU_NAME"] = _sidecar_daemon_name(session)
     _exec_route_is_sidecar[route_key] = local_sidecar
+    # P22 (local): an explicit session keeps its own BU_NAME (the harness namespaces the
+    # daemon/browser by it). Unnamed calls get one daemon per Hermes browser session;
+    # sharing the harness's ``default`` daemon meant a relay left over from an earlier
+    # browser answered for every later call and the endpoint we resolved was ignored
+    # (see _daemon_name_for_session). A local-sidecar route already has its own
+    # ``_local_*`` daemon above, so it is excluded here.
+    if not session and not local_sidecar:
+        endpoint = env.get("BU_CDP_WS") or env.get("BU_CDP_URL")
+        if endpoint:
+            name = _daemon_name_for_session(_backend_cache_key(task_id, ""))
+            # Same name, different endpoint, old browser still up (route changed mid-session:
+            # /browser connect, real-profile toggle, provider switch): its relay must not serve us.
+            previous = _DAEMON_ENDPOINTS.get(name)
+            if previous and previous != endpoint and _endpoint_reachable(previous):
+                name = f"{name}-{hashlib.sha1(endpoint.encode('utf-8')).hexdigest()[:6]}"
+            _DAEMON_ENDPOINTS[name] = endpoint
+            env["BU_NAME"] = name
     bot_desktop_browser = bool(env.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None))
 
     # SHARED browser (/browser connect CDP override): pin each named session to its own tab (see

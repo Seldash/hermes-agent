@@ -4634,7 +4634,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
         except Exception:
             pass  # best-effort; don't block gateway startup
 
-    from gateway.run import start_gateway
+    from gateway.run import start_gateway, run_with_bounded_executor_shutdown
     print("┌─────────────────────────────────────────────────────────┐")
     print("│           ☤ Hermes Gateway Starting...                 │")
     print("├─────────────────────────────────────────────────────────┤")
@@ -4666,7 +4666,9 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
 
     success = False
     try:
-        success = asyncio.run(start_gateway(replace=replace, force=force, verbosity=verbosity))
+        success = run_with_bounded_executor_shutdown(
+            start_gateway(replace=replace, force=force, verbosity=verbosity)
+        )
         _exit_diag("asyncio.run.returned", success=success)
     except KeyboardInterrupt:
         # Detached Windows runs absorb SIGINT above; keep the handler for console runs.

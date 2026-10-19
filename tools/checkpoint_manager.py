@@ -95,66 +95,15 @@ _PRUNE_MARKER_NAME = ".last_prune"
 _LEDGER_MAX_ENTRIES = 2000
 
 DEFAULT_EXCLUDES = [
-    # Dependency / build output
-    "node_modules/",
-    "dist/",
-    "build/",
-    "target/",
-    "out/",
-    ".next/",
-    ".nuxt/",
-    # Caches
-    "__pycache__/",
-    "*.pyc",
-    "*.pyo",
-    ".cache/",
-    ".pytest_cache/",
-    ".mypy_cache/",
-    ".ruff_cache/",
-    "coverage/",
-    ".coverage",
-    # Virtualenvs
-    ".venv/",
-    "venv/",
-    "env/",
-    # VCS
-    ".git/",
-    ".hg/",
-    ".svn/",
-    # Worktrees (Hermes convention — don't recursively snapshot siblings)
-    ".worktrees/",
-    # Native / compiled binaries
-    "*.so",
-    "*.dylib",
-    "*.dll",
-    "*.o",
-    "*.a",
-    "*.jar",
-    "*.class",
-    "*.exe",
-    "*.obj",
-    # Media / large binaries
-    "*.mp4",
-    "*.mov",
-    "*.mkv",
-    "*.webm",
-    "*.zip",
-    "*.tar",
-    "*.tar.gz",
-    "*.tgz",
-    "*.7z",
-    "*.rar",
-    "*.iso",
-    # Secrets
-    ".env",
-    ".env.*",
-    ".env.local",
-    ".env.*.local",
     # OS junk
     ".DS_Store",
     "Thumbs.db",
     # Logs
     "*.log",
+    # /tmp system artifacts owned by root and unreadable to the agent user: git aborts
+    # `add -A` with "fatal: 添加文件失败" (exit 128) when a workdir (pytest tmp_path, agent
+    # scratch) contains them.  P12, 2026-09-13 (40 ERRORS/day -> 0).
+    "snap-private-tmp/", "systemd-private-*/", ".org.chromium.Chromium.*/", "gdm3-config-err-*",
 ]
 
 # Git subprocess timeout (seconds).
@@ -212,6 +161,13 @@ def _validate_file_path(file_path: str, working_dir: str) -> Optional[str]:
 def _normalize_path(path_value: str) -> Path:
     """Return a canonical absolute path for checkpoint operations."""
     return Path(path_value).expanduser().resolve()
+
+
+# Temp roots themselves are never snapshotted (throwaway scratch; their only payload is browser
+# caches and stray root-owned artifacts whose unreadable entries make `git add -A` exit 128).
+# Paths *below* them stay eligible — pytest tmp_path projects must still checkpoint.
+_TEMP_ROOTS: frozenset = frozenset(
+    {str(_normalize_path(p)) for p in (tempfile.gettempdir(), "/var/tmp", "/dev/shm")})
 
 
 def _project_hash(working_dir: str) -> str:
@@ -371,12 +327,15 @@ def _run_git(
     """
     normalized_working_dir = _normalize_path(working_dir)
     if not normalized_working_dir.exists():
+        # P12/531638 (local): a missing working dir is an expected skip, not a failure —
+        # logger.error here drove health_snapshot's "real errors last 24h" counter over
+        # threshold.  Downgraded to warning; unreadable-dir semantics unchanged.
         msg = f"working directory not found: {normalized_working_dir}"
-        logger.error("Git command skipped: %s (%s)", " ".join(["git"] + list(args)), msg)
+        logger.warning("Git command skipped: %s (%s)", " ".join(["git"] + list(args)), msg)
         return False, "", msg
     if not normalized_working_dir.is_dir():
         msg = f"working directory is not a directory: {normalized_working_dir}"
-        logger.error("Git command skipped: %s (%s)", " ".join(["git"] + list(args)), msg)
+        logger.warning("Git command skipped: %s (%s)", " ".join(["git"] + list(args)), msg)
         return False, "", msg
 
     env = _git_env(store, str(normalized_working_dir), index_file=index_file)
@@ -928,8 +887,9 @@ class CheckpointManager:
 
         abs_dir = str(_normalize_path(working_dir))
 
-        # Skip root, home, and other overly broad directories
-        if abs_dir in {"/", str(Path.home())}:
+        # Skip root, home, and other overly broad directories (P12 adds the temp roots:
+        # a /tmp-starting workdir would otherwise snapshot root-owned junk and abort 128).
+        if abs_dir in {"/", str(Path.home())} or abs_dir in _TEMP_ROOTS:
             logger.debug("Checkpoint skipped: directory too broad (%s)", abs_dir)
             return False
 

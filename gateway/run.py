@@ -28,7 +28,7 @@ from collections import OrderedDict
 from contextvars import Context, copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Callable, Dict, Optional, Any, List, Tuple, cast
+from typing import Callable, Coroutine, Dict, Optional, Any, List, Tuple, cast
 
 from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
@@ -5945,6 +5945,36 @@ def _guard_corrupt_user_config() -> None:
         raise SystemExit(2) from exc
 
 
+def run_with_bounded_executor_shutdown(
+    coro: Coroutine[Any, Any, bool], executor_timeout: float = 15.0
+) -> bool:
+    """Run a top-level gateway coroutine, bounding the default-executor join.
+
+    ``asyncio.run()``'s internal ``Runner.close()`` joins the default executor
+    with a hard 300s timeout (``THREAD_JOIN_TIMEOUT``) *before* any os._exit
+    backstop (``_exit_after_graceful_shutdown``) can run, so a wedged executor
+    thread (e.g. a platform SDK WS worker left behind by a timeout-detached
+    disconnect — 2026-09-04 game-dev feishu instance stalled the restart
+    ~5min) strands the gateway half-shut.  Driving the Runner manually lets us
+    shrink that join to a bounded timeout: ``shutdown_default_executor()`` is
+    idempotent (``_executor_shutdown_called``), so ``Runner.close()``'s own
+    later call returns immediately.  Exception semantics match ``asyncio.run``
+    (SystemExit / KeyboardInterrupt propagate after cleanup).
+    """
+    runner = asyncio.Runner()
+    try:
+        return runner.run(coro)
+    finally:
+        try:
+            loop = runner.get_loop()
+            loop.run_until_complete(
+                loop.shutdown_default_executor(timeout=executor_timeout)
+            )
+        except Exception:
+            pass  # loop closed / executor gone — nothing left to join
+        runner.close()
+
+
 def main():
     """CLI entry point for the gateway."""
     # Before any config-dependent startup (watchdog, DB opens, provider resolution).
@@ -6024,7 +6054,10 @@ def main():
         # planned-restart, and service-restart paths, all of which complete teardown first. Routing those
         # codes through the same os._exit backstop means EVERY exit path is wedge-proof, not just the
         # boolean-return ones.
-        success = asyncio.run(start_gateway(config))
+        # Bounded default-executor join on exit — see run_with_bounded_executor_shutdown()
+        # (asyncio.run's 300s Runner.close join previously stalled restarts ~5min:
+        # 2026-09-04 game-dev feishu).
+        success = run_with_bounded_executor_shutdown(start_gateway(config))
         exit_code = 0 if success else 1
     except SystemExit as e:
         # e.code may be None (→ 0), an int, or a str (→ 1, like CPython).

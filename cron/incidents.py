@@ -138,8 +138,45 @@ def _incident_id(job_id: str, error_sig: str) -> str:
     return f"{job_id[:6]}_{error_sig}"
 
 
+def _authoritative_exit_code(error: str) -> Optional[int]:
+    """Exit code carried by a scheduler-written script header, else ``None``.
+
+    Mirrors ``cron.jobs.script_exit_code`` — the same first-3-lines authority the write-side rc=2
+    gate uses — so both ends of the contract read the same header shapes. An unavailable mirror
+    returns ``None``: the caller then keeps the keyword path (the previous behaviour).
+    """
+    try:
+        from cron.jobs import script_exit_code
+
+        return script_exit_code(error)
+    except Exception:
+        return None
+
+
+def _alert_exit_code() -> int:
+    """``cron.jobs.ALERT_EXIT_CODE`` (contract SSOT: ``~/.hermes/scripts/cron_exit_codes.py``)."""
+    try:
+        from cron.jobs import ALERT_EXIT_CODE
+
+        return int(ALERT_EXIT_CODE)
+    except Exception:
+        return 2
+
+
 def _classify_failure_type(error: str) -> str:
-    """Classify a failure from error-text keywords; ``unknown`` is the default."""
+    """Classify a failure; an authoritative exit code wins over error-text keywords.
+
+    ``Script exited with code N`` (scheduler-written, first lines) *states* how the script ended:
+    rc 2 (EXIT_ALERT) → ``alert``, any other code → ``script``. Keywords are only a guess over
+    arbitrary text — stdout naming a check (``subprocess_no_timeout``) or a crash body quoting
+    another job's ``timeout`` used to relabel plain rc=1 script failures as ``timeout``
+    (rows 56874d…/ff334c… and 5 more in ``cron_incidents`` on 2026-10-11). No authoritative header
+    (a real timeout, an agent failure, ``Script not found``) keeps the keyword order below, and
+    ``unknown`` stays the default.
+    """
+    code = _authoritative_exit_code(error)
+    if code is not None:
+        return "alert" if code == _alert_exit_code() else "script"
     text = _normalize_error(error)
     if not text:
         return "unknown"

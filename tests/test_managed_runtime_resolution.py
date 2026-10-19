@@ -66,6 +66,7 @@ _EXEMPT_DIRS = (
     ".venv",
     "venv",
     ".worktrees",
+    ".hermes-runtime",  # host-managed CPython runtime (gitignored build artifact)
 )
 
 # Call sites where a bare PATH lookup is the correct answer. Each entry is

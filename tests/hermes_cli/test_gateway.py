@@ -51,6 +51,13 @@ def _run_native_windows_gateway_start_diag(
         fake_run = types.ModuleType("gateway.run")
         fake_run.start_gateway = start_gateway
         fake_run._exit_after_graceful_shutdown = lambda code: None
+        # Local patch (CUSTOM_PATCHES.md T2): ``hermes_cli.gateway`` imports
+        # ``run_with_bounded_executor_shutdown`` from ``gateway.run``. The real
+        # helper runs the coroutine and joins the default executor with a
+        # bounded timeout, so ``asyncio.run`` is the faithful minimal stub.
+        import asyncio as _aio
+
+        fake_run.run_with_bounded_executor_shutdown = _aio.run
         sys.modules["gateway.run"] = fake_run
 
         gateway_cli._guard_official_docker_root_gateway = lambda: None
@@ -166,6 +173,13 @@ def test_gateway_run_subprocess_preserves_daemon_exit_codes(
         fake_run = types.ModuleType("gateway.run")
         fake_run.start_gateway = start_gateway
         setattr(fake_run, "_exit_after_graceful_shutdown", sys.exit)
+        # Local patch (CUSTOM_PATCHES.md T2): same stub as above — ``run_gateway``
+        # imports ``run_with_bounded_executor_shutdown`` from ``gateway.run``
+        # (P7 bounded default-executor join); without it the import fails and
+        # the process exits 1, masking the daemon exit-code contract under test.
+        import asyncio as _aio
+
+        fake_run.run_with_bounded_executor_shutdown = _aio.run
         sys.modules["gateway.run"] = fake_run
 
         gateway_cli._guard_official_docker_root_gateway = lambda: None

@@ -371,7 +371,13 @@ class TestCronBuilder:
             return [_build_job_prompt(job) for job in jobs]
 
     @staticmethod
-    def _skill_view(name: str) -> str:
+    def _skill_view(name: str, allow_platform_disabled: bool = False) -> str:
+        # P13 carried patch (见 CUSTOM_PATCHES.md T5 / T4): cron/scheduler_prompt.py
+        # 对显式列出的 cron skill 必须传 allow_platform_disabled=True —— 在这里钉成契约，
+        # 而不是用 **kwargs 静默容忍（那会把 P13 降级成无人看守）。
+        assert allow_platform_disabled is True, (
+            "P13: cron skill 加载必须调用 skill_view(..., allow_platform_disabled=True)"
+        )
         import json
 
         if name == "missing":

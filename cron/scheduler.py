@@ -323,6 +323,8 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
 
 
 DEFAULT_FAILURE_REPEAT_ALERT_HOURS = 6.0
+#: rc=2 repeats of the same alert stay silent this long (``0`` = never suppress).
+DEFAULT_ALERT_REPEAT_SUPPRESS_HOURS = 6.0
 
 
 def _failure_repeat_alert_hours() -> float:
@@ -331,6 +333,62 @@ def _failure_repeat_alert_hours() -> float:
     from cron.jobs import _cron_config_number
 
     return _cron_config_number("failure_repeat_alert_hours", DEFAULT_FAILURE_REPEAT_ALERT_HOURS, float)
+
+
+def _alert_repeat_suppress_hours() -> float:
+    """``cron.alert_repeat_suppress_hours``: window in which a repeated rc=2 business alert (same
+    job + same text) is not re-delivered. ``0`` disables suppression (alert on every run)."""
+    from cron.jobs import _cron_config_number
+
+    return _cron_config_number(
+        "alert_repeat_suppress_hours", DEFAULT_ALERT_REPEAT_SUPPRESS_HOURS, float)
+
+
+_BUSINESS_ALERT_HEADER_RE = re.compile(
+    r"(?:script exited with code|退出码)\s*[:：]?\s*2\b", re.IGNORECASE)
+
+
+def _is_business_alert(error: Any) -> bool:
+    """True when the run's error text names the business-alert exit code (rc=2 / ``EXIT_ALERT``).
+
+    Consults the local mirror ``cron.jobs.script_exit_code`` (authoritative header shapes only), so
+    an unparseable/missing code falls through to the failure path — the fail-safe direction.
+    """
+    from cron.jobs import ALERT_EXIT_CODE, script_exit_code
+
+    return script_exit_code(str(error or "")) == ALERT_EXIT_CODE
+
+
+def _business_alert_text(error: Any, *, limit: int = 600) -> str:
+    """The alert content: the error text minus the scheduler's exit-code header line(s)."""
+    lines = [
+        line for line in str(error or "").splitlines()
+        if not _BUSINESS_ALERT_HEADER_RE.search(line)
+    ]
+    return " ".join(" ".join(lines).split())[:limit]
+
+
+def _compose_business_alert_delivery(job: dict, error: Any) -> str:
+    """Delivery text for an rc=2 run: forward the finding, deduped inside the cooldown window.
+
+    Never creates an incident (that is the point of the exit-code contract) and returns ``""``
+    when the same alert already went out inside ``cron.alert_repeat_suppress_hours``.
+    """
+    from cron import alert_cooldown
+
+    text = _business_alert_text(error)
+    suppressed, count = alert_cooldown.note(
+        str(job.get("id") or ""), text, hours=_alert_repeat_suppress_hours())
+    if suppressed:
+        logger.debug(
+            "Business alert for job %s suppressed (repeat #%s inside the window)", job.get("id"), count)
+        return ""
+    from cron.scheduler_failure_copy import business_alert_notice
+
+    content = business_alert_notice(job.get("name") or job["id"], job["id"], text)
+    if count > 1:
+        content += f" (repeat #{count} inside the suppression window)"
+    return content
 
 
 def _repeat_alert_withheld(incident: dict) -> bool:
@@ -414,16 +472,18 @@ class CronPromptInjectionBlocked(Exception):
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """Toolsets a cron-spawned agent must never receive: ``messaging``/``clarify`` always
     (interactive); ``cronjob`` by default (loop prevention, not a security boundary —
-    ``cron.allow_agent_scheduling: true`` lifts only that); ``agent.disabled_toolsets`` layered on
-    top so per-job ``enabled_toolsets`` cannot widen past config.yaml's denylist.
+    ``cron.allow_agent_scheduling: true`` lifts only that); ``memory`` always (local
+    override, 2026-08-23 — cron runs get no persistent-memory read/write, matching
+    ``skip_memory=True`` at the agent construction site); ``agent.disabled_toolsets``
+    layered on top so per-job ``enabled_toolsets`` cannot widen past config.yaml's denylist.
 
     See #25752.
     """
     cron_cfg = (cfg or {}).get("cron") or {}
     if cron_cfg.get("allow_agent_scheduling"):
-        disabled = ["messaging", "clarify"]
+        disabled = ["messaging", "clarify", "memory"]
     else:
-        disabled = ["cronjob", "messaging", "clarify"]
+        disabled = ["cronjob", "messaging", "clarify", "memory"]
     agent_cfg = (cfg or {}).get("agent") or {}
     from agent.skill_utils import parse_config_string_list
 
@@ -2491,7 +2551,13 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         # Project context files only with a configured workdir; SOUL.md always.
         skip_context_files=not bool(workdir),
         load_soul_identity=True,
-        skip_memory=False,
+        # Memory is DISABLED for cron agents (local override, 2026-08-23):
+        # upstream v0.20.5 flipped skip_memory to False (ef04d846e), which
+        # loads MEMORY.md into every cron prompt and lets scheduled jobs write
+        # persistent memory. 0 of 188 local jobs request it; the exposure /
+        # contamination / token cost is not worth it. The memory toolset is
+        # denylisted in _resolve_cron_disabled_toolsets to match.
+        skip_memory=True,
         skip_background_review=True,  # Cron has no human-in-the-loop need for skill/memory review forks (~30K tok/event)
         platform="cron",
         session_id=session_id,
@@ -2943,6 +3009,21 @@ def _compose_run_delivery(
     elif success:
         deliver_content = final_response
         _resolve_incidents_for_recovered_job(job)
+    elif _is_business_alert(err):
+        # rc=2 (EXIT_ALERT): the script ran to completion and already reported what it found —
+        # not a failure, so this branch records NO incident (待办 853482 的写入端闸门). The alert
+        # still reaches the user; a repeat of the same text is deduped by the alert cooldown.
+        # rc=1 / rc=7 / timeout / unparseable stay on the failure path below (fail-safe).
+        deliver_content = _compose_business_alert_delivery(job, err)
+        # (P19 注入点4: rc=2 亦解析存量条目 — 待办 256052, 2026-10-14) 只出 rc=2、从不 success 的作业
+        # （代码健康扫描 / 管线告警守护 / 格式合规周检 自 10-01 起全 rc=2）原先既够不上 ack 判据
+        # （告警型按治理口径刻意不 ack —— ack 会静默该签名的失败提醒），又永远等不到 success 跑次
+        # ⇒ 闸门落地前的存量行**没有退出路径**，永久滞留在「未确认」面（实测 12 条 / 滞留 8~11 天，
+        # 且门限只看真失败故永不亮灯）。rc=2 的语义是「脚本跑完并已自报本次发现」，与消费侧
+        # ``cron_governance_weekly._runs_since`` 把 rc=2 计入「正常运行」的口径一致。
+        # resolved ≠ 静默：投递抑制只看 ``closed`` 态与 ``alerted_at`` 冷却；同签名再犯会由
+        # ``upsert_incident`` 重新开条并重置冷却窗口。
+        _resolve_incidents_for_recovered_job(job)
     else:
         # Record the job+error signature once; withhold the per-run ping while the operator
         # already acked it (closed) or was already told (alerted, inside the reminder cooldown).
@@ -3210,7 +3291,13 @@ def _deliver_crash_failure(
     """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome)."""
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
     # Same ack gate as the normal failure delivery: acked signatures stay silent here too.
-    incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
+    if _is_business_alert(err_text):
+        # Defensive: this path carries exception text, but the rc=2 contract (待办 853482: a
+        # business alert is not a failure) must hold on EVERY write site — no ledger row here
+        # either. Delivery below still runs: an alert is never swallowed.
+        incident_acked, failure_incident_id = False, None
+    else:
+        incident_acked, failure_incident_id = _upsert_incident_for_failure(job, err_text)
     if incident_acked:
         return None, "suppressed_acked"
     delivery_error = None

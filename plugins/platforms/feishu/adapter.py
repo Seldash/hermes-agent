@@ -142,6 +142,14 @@ _FEISHU_DOC_UPLOAD_TYPES = {
 # --- Connection, retry and batching tuning ---
 _MAX_TEXT_INJECT_BYTES = 100 * 1024
 _FEISHU_CONNECT_ATTEMPTS = 3
+# Fake-alive guard (2026-09-03): the SDK thread is submitted and the adapter
+# used to log "Connected" optimistically without ever confirming the real
+# WebSocket handshake. When the SDK start() failed silently (swallowed
+# exception), the instance became an inbound black hole that restarts did not
+# cure. This timeout bounds how long connect() waits for the SDK's actual
+# handshake (signalled via _ws_connected_event in _connect_with_overrides)
+# before treating the connect as failed and retrying.
+_FEISHU_WS_CONNECT_CONFIRM_TIMEOUT = 25.0
 _FEISHU_SEND_ATTEMPTS = 3
 _FEISHU_APP_LOCK_SCOPE = "feishu-app-id"
 _DEFAULT_TEXT_BATCH_DELAY_SECONDS = 0.6
@@ -319,6 +327,13 @@ class FeishuAdapterSettings:
     group_rules: dict[str, FeishuGroupRule] = field(default_factory=dict)
     allow_bots: str = "none"  # "none" | "mentions" | "all"
     require_mention: bool = True
+    # Display-name -> open_id map for known bots in shared groups. Outbound
+    # text matching "@<name>" is upgraded to a real Feishu mention so the
+    # target bot actually receives the message (Feishu only pushes a bot's
+    # group message to another bot when the message carries a real mention;
+    # plain-text "@Name" is just characters). Parsed from
+    # FEISHU_BOT_MENTION_MAP (format: "Name1=ou_xxx,Name2=ou_yyy").
+    bot_mention_map: Dict[str, str] = field(default_factory=dict)
     allow_all_dm: bool = False  # resolved per-profile so multiplexed adapters honor their own .env
 
 
@@ -440,12 +455,45 @@ def _coerce_required_int(value: Any, default: int, min_value: int = 0) -> int:
 
 # --- Post payload builders and parsers ---
 
-def _build_markdown_post_payload(content: str) -> str:
-    rows = _build_markdown_post_rows(content)
+_MENTION_PLACEHOLDER_RE_OUT = re.compile(r"@_mention_(\d+)")
+
+
+def _split_mention_row(
+    segment: str, mention_ids: Optional[List[str]] = None
+) -> List[Dict[str, str]]:
+    """Split a post row at outbound mention placeholders into mixed elements.
+
+    Feishu post rows are element lists; a real mention must be an ``at``
+    element (``{"tag": "at", "user_id": <open_id>}``) — a text "@Name" is not
+    recognized as a mention by the platform, so a bot target never receives
+    it. Surrounding markdown stays in ``md`` elements so rendering is kept.
+    """
+    if not mention_ids:
+        return [{"tag": "md", "text": segment}]
+    parts: List[Dict[str, str]] = []
+    pos = 0
+    for m in _MENTION_PLACEHOLDER_RE_OUT.finditer(segment):
+        if m.start() > pos:
+            parts.append({"tag": "md", "text": segment[pos : m.start()]})
+        idx = int(m.group(1))
+        if 0 <= idx < len(mention_ids):
+            parts.append({"tag": "at", "user_id": mention_ids[idx]})
+        pos = m.end()
+    if pos < len(segment):
+        parts.append({"tag": "md", "text": segment[pos:]})
+    return parts or [{"tag": "md", "text": segment}]
+
+
+def _build_markdown_post_payload(
+    content: str, *, mention_ids: Optional[List[str]] = None
+) -> str:
+    rows = _build_markdown_post_rows(content, mention_ids=mention_ids)
     return json.dumps({"zh_cn": {"content": rows}}, ensure_ascii=False)
 
 
-def _build_markdown_post_rows(content: str) -> list[list[dict[str, str]]]:
+def _build_markdown_post_rows(
+    content: str, *, mention_ids: Optional[List[str]] = None
+) -> List[List[Dict[str, str]]]:
     """Build Feishu post rows, giving each fenced code block its own row.
 
     Feishu's `md` renderer can swallow trailing content when a fence sits inside one
@@ -454,7 +502,7 @@ def _build_markdown_post_rows(content: str) -> list[list[dict[str, str]]]:
     if not content:
         return [[{"tag": "md", "text": ""}]]
     if "```" not in content:
-        return [[{"tag": "md", "text": content}]]
+        return [_split_mention_row(content, mention_ids)]
 
     rows: list[list[dict[str, str]]] = []
     current: list[str] = []
@@ -464,7 +512,7 @@ def _build_markdown_post_rows(content: str) -> list[list[dict[str, str]]]:
         nonlocal current
         segment = "\n".join(current)
         if segment.strip():
-            rows.append([{"tag": "md", "text": segment}])
+            rows.append(_split_mention_row(segment, mention_ids))
         current = []
 
     for raw_line in content.splitlines():
@@ -478,7 +526,7 @@ def _build_markdown_post_rows(content: str) -> list[list[dict[str, str]]]:
             if not in_code_block:  # closing fence: the code block becomes its own row
                 _flush_current()
     _flush_current()
-    return rows or [[{"tag": "md", "text": content}]]
+    return rows or [_split_mention_row(content, mention_ids)]
 
 
 def parse_feishu_post_payload(
@@ -1063,7 +1111,14 @@ def _install_lark_ws_isolation(ws_client_module: Any) -> None:
             overrides = getattr(_ws_isolation_state, "connect_kwargs", None) or {}
             for key, value in overrides.items():
                 kwargs.setdefault(key, value)
-            return real_connect(*args, **kwargs)
+            result = real_connect(*args, **kwargs)
+            # Real SDK-level WS handshake completed. Signal connect()'s
+            # fake-alive guard so it stops waiting (re-set on every reconnect;
+            # harmless when nobody is waiting).
+            conn_evt = getattr(_ws_isolation_state, "connected_event", None)
+            if conn_evt is not None:
+                conn_evt.set()
+            return result
 
         # Keep inspect.signature(websockets.connect) honest — the SDK probes it for ``proxy`` support.
         _dispatch_connect.__wrapped__ = real_connect
@@ -1113,6 +1168,11 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     adapter._ws_thread_loop = loop
+    logger.info(
+        "[Feishu] SDK thread entered (app=...%s, thread=%s) — installing ws overrides",
+        str(getattr(adapter, "_app_id", "") or "")[-6:],
+        threading.get_ident(),
+    )
     original_configure = getattr(ws_client, "_configure", None)
 
     def _apply_runtime_ws_overrides() -> None:
@@ -1130,10 +1190,18 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
 
     connect_overrides = {
         key: value
-        for key, value in (("ping_interval", adapter._ws_ping_interval), ("ping_timeout", adapter._ws_ping_timeout))
+    # Defensive reads: minimal fakes and partially-initialised adapters may not define these
+    # attributes, and a missing one must mean "no override", not AttributeError.
+        for key, value in (
+            ("ping_interval", getattr(adapter, "_ws_ping_interval", None)),
+            ("ping_timeout", getattr(adapter, "_ws_ping_timeout", None)),
+        )
         if value is not None
     }
-    adapter_loop = adapter._loop
+    # Defensive read (local test doubles / partially-initialised adapters may not expose it; a
+    # missing loop must mean "no hop", not AttributeError — a dying SDK thread is a silent
+    # inbound black hole).
+    adapter_loop = getattr(adapter, "_loop", None)
 
     def _on_reconnecting() -> None:
         if adapter_loop is not None and not adapter_loop.is_closed():
@@ -1149,6 +1217,11 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     _install_lark_ws_isolation(ws_client_module)
     _ws_isolation_state.loop = loop
     _ws_isolation_state.connect_kwargs = connect_overrides
+    # Fake-alive guard: the SDK thread signals this event once its real WebSocket
+    # handshake succeeds (see _dispatch_connect in _install_lark_ws_isolation);
+    # connect() waits on it with a timeout so a dead SDK start fails loudly
+    # instead of logging "Connected".
+    _ws_isolation_state.connected_event = getattr(adapter, "_ws_connected_event", None)
     _ws_isolation_state.on_link_up = _on_link_up
     _ws_isolation_state.adapter = adapter
 
@@ -1162,15 +1235,31 @@ def _run_official_feishu_ws_client(ws_client: Any, adapter: Any) -> None:
     if original_configure is not None:
         ws_client._configure = _configure_with_overrides
     _apply_runtime_ws_overrides()
+    logger.info(
+        "[Feishu] SDK start() invoking (app=...%s, thread=%s)",
+        str(getattr(adapter, "_app_id", "") or "")[-6:],
+        threading.get_ident(),
+    )
     try:
         ws_client.start()
     except Exception:
-        pass
+        # NEVER silent. A swallowed start() exception previously produced a
+        # fake-alive adapter: "Connected in websocket mode" was logged
+        # optimistically while the SDK had no real connection → inbound
+        # black hole, restarts did not cure it (2026-09-03 incident).
+        logger.error(
+            "[Feishu] WS SDK client start() raised (app_id=...%s, thread=%s) — "
+            "no real connection established; connect() fake-alive guard will retry",
+            str(getattr(adapter, "_app_id", "") or "")[-6:],
+            threading.get_ident(),
+            exc_info=True,
+        )
     finally:
         _ws_isolation_state.loop = None
         _ws_isolation_state.connect_kwargs = None
         _ws_isolation_state.on_link_up = None
         _ws_isolation_state.adapter = None
+        _ws_isolation_state.connected_event = None
         if original_configure is not None:
             ws_client._configure = original_configure
         pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
@@ -1306,7 +1395,22 @@ class FeishuAdapter(BasePlatformAdapter):
         self._sdk_executor_lock = threading.Lock()
         self._sdk_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
         self._sdk_executor_closing = False  # set on disconnect so a real teardown isn't resurrected
+        # Adapter-owned pool for the long-lived official-SDK WebSocket client
+        # thread (_run_official_feishu_ws_client). Routing it through asyncio's
+        # shared default executor (run_in_executor(None, ...)) wedges gateway
+        # exit: Runner.close() joins the default executor for 300s
+        # (THREAD_JOIN_TIMEOUT) when the WS client thread lingers on a
+        # half-dead connection after a timeout-detached disconnect — observed
+        # 2026-09-04 (game-dev instance stalled restart 5min). Same
+        # recreate-on-shutdown/closing pattern as _sdk_executor (#10849).
+        self._ws_executor_lock = threading.Lock()
+        self._ws_executor: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._ws_executor_closing = False
         self._ws_client = self._ws_future = self._ws_supervisor = self._ws_thread_loop = None
+        # Set when the SDK's real WebSocket handshake completes (see
+        # _connect_with_overrides); connect() waits on it with a timeout so
+        # "Connected" is never logged for a connection that does not exist.
+        self._ws_connected_event: Optional[threading.Event] = None
         self._ws_restart_backoff = 5.0
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._webhook_runner = self._webhook_site = self._event_handler = None
@@ -1387,6 +1491,28 @@ class FeishuAdapter(BasePlatformAdapter):
         allow_all_dm = any(
             _secret(var).lower() in {"true", "1", "yes"} for var in ("FEISHU_ALLOW_ALL_USERS", "GATEWAY_ALLOW_ALL_USERS")
         )
+
+        # Name -> open_id map for outbound "@<name>" -> real mention upgrades.
+        bot_mention_map: Dict[str, str] = {}
+        for pair in os.getenv("FEISHU_BOT_MENTION_MAP", "").split(","):
+            pair = pair.strip()
+            if not pair:
+                continue
+            if "=" not in pair:
+                logger.warning(
+                    "[Feishu] Ignoring malformed FEISHU_BOT_MENTION_MAP entry: %r", pair
+                )
+                continue
+            name, open_id = (part.strip() for part in pair.split("=", 1))
+            if name and open_id:
+                bot_mention_map[name] = open_id
+        if bot_mention_map:
+            logger.info(
+                "[Feishu] Bot mention map: %d name(s) -> %s",
+                len(bot_mention_map),
+                ", ".join(sorted(bot_mention_map)),
+            )
+
         return FeishuAdapterSettings(
             app_id=_extra_or_secret("app_id", "FEISHU_APP_ID"),
             app_secret=_extra_or_secret("app_secret", "FEISHU_APP_SECRET"),
@@ -1416,6 +1542,7 @@ class FeishuAdapter(BasePlatformAdapter):
             default_group_policy=str(extra.get("default_group_policy", "")).strip().lower(),
             group_rules=group_rules, allow_bots=allow_bots, allow_all_dm=allow_all_dm,
             require_mention=_to_boolean(extra.get("require_mention", _get_scoped_secret("FEISHU_REQUIRE_MENTION", "true"))),
+            bot_mention_map=bot_mention_map,
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1490,9 +1617,59 @@ class FeishuAdapter(BasePlatformAdapter):
         except TypeError:
             executor.shutdown(wait=False)
 
+    def _get_ws_executor(self) -> concurrent.futures.ThreadPoolExecutor:
+        """Return the adapter-owned executor hosting the official-SDK WS client.
+
+        Mirrors ``_get_sdk_executor``: the long-lived WS client thread must NOT
+        run on asyncio's shared default executor — ``asyncio.run``'s
+        ``Runner.close()`` joins the default executor with a hard 300s timeout,
+        so any WS thread that lingers on a half-dead connection after a
+        timeout-detached disconnect stalls the whole gateway exit (2026-09-04,
+        game-dev instance stalled restart ~5min). A pool owned by the adapter
+        is outside that join and is torn down non-blocking on disconnect.
+        """
+        lock = getattr(self, "_ws_executor_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._ws_executor_lock = lock
+        with lock:
+            if getattr(self, "_ws_executor_closing", False):
+                raise RuntimeError("Feishu adapter is shutting down; WS executor unavailable")
+            executor = getattr(self, "_ws_executor", None)
+            if executor is None or getattr(executor, "_shutdown", False):
+                executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=2,
+                    thread_name_prefix="hermes-feishu-ws",
+                )
+                self._ws_executor = executor
+            return executor
+
+    def _shutdown_ws_executor(self) -> None:
+        """Stop the adapter-owned WS executor without touching the loop default.
+
+        Non-blocking (``wait=False``): a WS thread stuck on a half-dead socket
+        is deliberately abandoned rather than joined — the process is exiting
+        and systemd will revive the gateway; Python 3.12 pool threads are
+        daemon so they cannot block interpreter finalization.
+        """
+        lock = getattr(self, "_ws_executor_lock", None)
+        if lock is None:
+            return
+        with lock:
+            self._ws_executor_closing = True
+            executor = getattr(self, "_ws_executor", None)
+            self._ws_executor = None
+        if executor is None:
+            return
+        try:
+            executor.shutdown(wait=False, cancel_futures=True)
+        except TypeError:
+            executor.shutdown(wait=False)
+
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         """Connect to Feishu/Lark."""
         self._sdk_executor_closing = False  # re-arm the SDK executor after a prior disconnect
+        self._ws_executor_closing = False
         if not self._app_id or not self._app_secret:
             logger.error("[Feishu] FEISHU_APP_ID or FEISHU_APP_SECRET not set")
             return False
@@ -1526,6 +1703,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 return False
 
             self._loop = asyncio.get_running_loop()
+            # Fresh guard per connect/reconnect cycle; set by the SDK thread
+            # once its real WebSocket handshake succeeds.
+            self._ws_connected_event = threading.Event()
             await self._connect_with_retry()
             if self._connection_mode == "websocket":
                 # The WS thread can die without any external signal; keep a watcher alive.
@@ -1566,6 +1746,11 @@ class FeishuAdapter(BasePlatformAdapter):
         self._loop = None
         self._event_handler = None
         self._shutdown_sdk_executor()
+        # WS client executor shut down too (idempotent). Even when the outer
+        # teardown budget cancelled this disconnect early (timeout-detached),
+        # this line still runs via the CancelledError path above and releases
+        # the long-lived WS thread from the exit-critical default executor.
+        self._shutdown_ws_executor()
         self._persist_seen_message_ids()
         await self._release_app_lock()
         self._mark_disconnected()
@@ -1657,6 +1842,7 @@ class FeishuAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Not connected")
 
         formatted = self.format_message(content)
+        formatted, mention_ids, mention_names = self._extract_mentions(formatted)
         chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
         # Decide markdown-vs-text once for the whole message: a chunk of a long
         # markdown reply may be plain prose that fails the per-chunk regex and would
@@ -1670,14 +1856,14 @@ class FeishuAdapter(BasePlatformAdapter):
             return await self._feishu_send_with_retry(
                 chat_id=chat_id,
                 msg_type="text",
-                payload=json.dumps({"text": _strip_markdown_to_plain_text(chunk)}, ensure_ascii=False),
+                payload=json.dumps({"text": self._restore_mention_text(chunk, mention_ids, mention_names)}, ensure_ascii=False),
                 reply_to=reply_to,
                 metadata=metadata,
             )
 
         try:
             for chunk in chunks:
-                msg_type, payload = self._build_outbound_payload(chunk, prefer_post=prefer_post)
+                msg_type, payload = self._build_outbound_payload(chunk, prefer_post=prefer_post, mention_ids=mention_ids)
                 try:
                     response = await self._feishu_send_with_retry(
                         chat_id=chat_id, msg_type=msg_type, payload=payload, reply_to=reply_to, metadata=metadata,
@@ -3617,7 +3803,53 @@ class FeishuAdapter(BasePlatformAdapter):
         return lock
 
     # --- Outbound payload construction and send pipeline ---
-    def _build_outbound_payload(self, content: str, *, prefer_post: bool = False) -> tuple[str, str]:
+
+    def _extract_mentions(self, content: str) -> tuple[str, List[str], List[str]]:
+        """Upgrade outbound "@<known-bot-name>" text to real Feishu mentions.
+
+        Feishu pushes a bot's group message to another bot only when the
+        message carries a real mention — plain text "@Name" is just characters
+        and the target bot never receives it. Names come from
+        FEISHU_BOT_MENTION_MAP; matched spans are replaced with
+        ``@_mention_N`` placeholders that ``_build_outbound_payload`` resolves
+        to ``at`` post elements.
+
+        Returns ``(content, open_id_list, name_list)``.
+        """
+        if not self._bot_mention_map or "@" not in content:
+            return content, [], []
+        names = sorted(self._bot_mention_map, key=len, reverse=True)
+        pattern = re.compile(
+            r"@(" + "|".join(re.escape(n) for n in names) + r")(?![\w\u4e00-\u9fff])"
+        )
+        mention_ids: List[str] = []
+        mention_names: List[str] = []
+
+        def _sub(m: "re.Match[str]") -> str:
+            idx = len(mention_ids)
+            name = m.group(1)
+            mention_ids.append(self._bot_mention_map[name])
+            mention_names.append(name)
+            return f"@_mention_{idx}"
+
+        return pattern.sub(_sub, content), mention_ids, mention_names
+
+    @staticmethod
+    def _restore_mention_text(
+        chunk: str, mention_ids: List[str], mention_names: List[str]
+    ) -> str:
+        """Reverse ``_extract_mentions`` placeholders for the text fallback
+        path (post payload rejected by the API): plain text cannot carry
+        mentions, so restore the original ``@Name`` text."""
+        text = _strip_markdown_to_plain_text(chunk)
+        for i, name in enumerate(mention_names):
+            text = text.replace(f"@_mention_{i}", f"@{name}")
+        return text
+
+    def _build_outbound_payload(
+        self, content: str, *, prefer_post: bool = False,
+        mention_ids: Optional[List[str]] = None,
+    ) -> tuple[str, str]:
         # Feishu clients render markdown tables inside ``post`` ``md`` elements natively, so tables
         # take the common markdown path (no text downgrade). ``prefer_post`` lets ``send`` keep every
         # chunk of a split markdown reply as ``post`` even when a chunk alone looks like prose.
@@ -3626,8 +3858,8 @@ class FeishuAdapter(BasePlatformAdapter):
         # lets ``send`` treat the chunk as part of a larger markdown document: when a long markdown reply is
         # split at MAX_MESSAGE_LENGTH, the per-chunk regex would otherwise mis-classify a plain-prose chunk
         # as ``text``. See #26841.
-        if prefer_post or _MARKDOWN_HINT_RE.search(content):
-            return "post", _build_markdown_post_payload(content)
+        if mention_ids or prefer_post or _MARKDOWN_HINT_RE.search(content):
+            return "post", _build_markdown_post_payload(content, mention_ids=mention_ids)
         return "text", json.dumps({"text": content}, ensure_ascii=False)
 
     @staticmethod
@@ -3893,8 +4125,44 @@ class FeishuAdapter(BasePlatformAdapter):
         # .update_response marker, reactions env, drive comments) runs under. A bare executor
         # thread has an empty context = launch profile. connect() runs inside the profile scope
         # under multiplex (and the supervisor task inherits it), so snapshot it here.
+        # P7: the dedicated (own) WS pool keeps the SDK's blocking receive loop off the
+        # shared SDK executor, so a stalled handshake cannot starve other SDK work.
         self._ws_future = loop.run_in_executor(
-            self._get_sdk_executor(), contextvars.copy_context().run, _run_official_feishu_ws_client, self._ws_client, self)
+            self._get_ws_executor(), contextvars.copy_context().run, _run_official_feishu_ws_client, self._ws_client, self)
+        # Fake-alive guard: wait for the SDK's REAL handshake instead of
+        # returning optimistically on thread submission. If the SDK start()
+        # failed (historically swallowed silently → inbound black hole,
+        # 2026-09-03), raise so _connect_with_retry retries and connect()
+        # reports the failure rather than logging "Connected" while dead.
+        conn_evt = self._ws_connected_event
+        if conn_evt is not None:
+            app_tail = str(self._app_id or "")[-6:]
+            logger.info(
+                "[Feishu] connect() waiting for SDK real handshake (app=...%s)",
+                app_tail,
+            )
+            try:
+                await asyncio.wait_for(
+                    asyncio.wrap_future(
+                        loop.run_in_executor(self._get_ws_executor(), conn_evt.wait)
+                    ),
+                    timeout=_FEISHU_WS_CONNECT_CONFIRM_TIMEOUT,
+                )
+                logger.info(
+                    "[Feishu] SDK real handshake confirmed (app=...%s)",
+                    app_tail,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "[Feishu] SDK handshake timeout after %.0fs (app=...%s) — fake-alive guard retry",
+                    _FEISHU_WS_CONNECT_CONFIRM_TIMEOUT,
+                    app_tail,
+                )
+                raise TimeoutError(
+                    "Feishu SDK did not complete the WebSocket handshake within "
+                    f"{_FEISHU_WS_CONNECT_CONFIRM_TIMEOUT:.0f}s "
+                    "(fake-alive guard)"
+                )
 
     async def _connect_webhook(self) -> None:
         if not FEISHU_WEBHOOK_AVAILABLE:

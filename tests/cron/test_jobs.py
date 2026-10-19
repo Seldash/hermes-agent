@@ -24,6 +24,8 @@ from cron.jobs import (
     heartbeat_run_claim,
     get_due_jobs,
     save_job_output,
+    script_exit_code,
+    ALERT_EXIT_CODE,
     _hermes_now,
 )
 
@@ -2029,3 +2031,102 @@ class TestEnsureCronDirWidened:
         with pytest.raises(FileNotFoundError):
             jobs._ensure_cron_dir(scripts_dir)
         assert not deleted_home.exists()
+
+
+# =========================================================================
+# rc-based outcome triage (contract SSOT: ~/.hermes/scripts/cron_exit_codes.py)
+# =========================================================================
+
+# The scheduler's real error text for a script that exits with the alert code.
+ALERT_ERROR = "Script exited with code 2\nstdout:\n🟡 管线告警: NAV 冻结"
+
+
+class TestScriptAlertOutcome:
+    """A run exiting with the contract's alert code (rc 2) is a business alert, not a failure.
+
+    Regression guard for 476075: the executor persisted such runs as ``last_status="error"`` and
+    grew ``failure_streak``, so a job that merely kept alerting read as repeatedly failing (and
+    tripped the "failed N runs" nudge).
+    """
+
+    def test_rc2_records_alert_status_keeps_text_and_no_streak(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        mark_job_run(job["id"], success=False, error=ALERT_ERROR)
+        updated = get_job(job["id"])
+        assert updated["last_status"] == "alert"
+        assert updated["last_error"] == ALERT_ERROR  # alert text stays inspectable
+        assert updated["failure_streak"] == 0
+
+    def test_repeated_alerts_never_accumulate_a_streak(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        for _ in range(4):
+            mark_job_run(job["id"], success=False, error=ALERT_ERROR)
+        assert get_job(job["id"])["failure_streak"] == 0
+
+    def test_alert_does_not_resurrect_a_prior_streak(self, tmp_cron_dir):
+        """A real streak must not survive a run that was only an alert."""
+        job = create_job(prompt="Report", schedule="every 1h")
+        mark_job_run(job["id"], success=False, error="boom")
+        mark_job_run(job["id"], success=False, error="boom")
+        assert get_job(job["id"])["failure_streak"] == 2
+        mark_job_run(job["id"], success=False, error=ALERT_ERROR)
+        assert get_job(job["id"])["failure_streak"] == 0
+
+    def test_real_failures_still_error_and_accumulate(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        mark_job_run(job["id"], success=False, error="Script exited with code 1\nstderr:\nboom")
+        assert get_job(job["id"])["last_status"] == "error"
+        assert get_job(job["id"])["failure_streak"] == 1
+        # No exit-code clue at all -> fail-safe: still a failure.
+        mark_job_run(job["id"], success=False, error="timeout")
+        assert get_job(job["id"])["last_status"] == "error"
+        assert get_job(job["id"])["failure_streak"] == 2
+
+    def test_child_exit_code_in_stdout_cannot_fake_an_alert(self, tmp_cron_dir):
+        """Only the authoritative header is trusted — a child's exit=2 in stdout is not ours."""
+        job = create_job(prompt="Report", schedule="every 1h")
+        mark_job_run(
+            job["id"], success=False,
+            error="Script exited with code 1\nstdout:\nsubprocess exit=2 (not this script)")
+        assert get_job(job["id"])["last_status"] == "error"
+        assert get_job(job["id"])["failure_streak"] == 1
+
+    def test_interrupted_run_stays_error(self, tmp_cron_dir):
+        """The interrupted contract keys off last_status == "error" — must not drift to alert."""
+        job = create_job(prompt="Report", schedule="every 1h")
+        mark_job_run(
+            job["id"], success=False,
+            error="Interrupted by shutdown before terminal completion")
+        assert get_job(job["id"])["last_status"] == "error"
+        assert get_job(job["id"])["failure_streak"] == 1
+
+    def test_explicit_status_override_wins_over_alert(self, tmp_cron_dir):
+        """An explicit terminal status (blocked_config) is not silently re-labelled an alert."""
+        job = create_job(prompt="Report", schedule="every 1h")
+        mark_job_run(job["id"], success=False, error=ALERT_ERROR, status="blocked_config")
+        updated = get_job(job["id"])
+        assert updated["last_status"] == "blocked_config"
+        assert updated["failure_streak"] == 1
+
+
+class TestScriptExitCodeHeader:
+    """``script_exit_code`` reads only the scheduler's authoritative header shapes."""
+
+    @pytest.mark.parametrize("text,expected", [
+        ("Script exited with code 2\nstderr:\nx", 2),
+        ("Script exited with code 1\nstderr:\nx", 1),
+        ("脚本退出码 2\nstdout:\n告警", 2),
+        ("脚本退出码：2", 2),
+        ("Script timed out after 300s: /x/y.py", None),
+        ("Interrupted by shutdown before terminal completion", None),
+        ("stdout:\nsubprocess exit=2", None),
+        (None, None),
+        ("", None),
+        (123, None),
+    ])
+    def test_header_parse(self, text, expected):
+        assert script_exit_code(text) == expected
+
+    def test_alert_code_matches_the_contract(self):
+        """rc 2 is the alert code in the SSOT contract (cron_exit_codes.EXIT_ALERT)."""
+        assert ALERT_EXIT_CODE == 2

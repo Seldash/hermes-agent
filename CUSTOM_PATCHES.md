@@ -1010,3 +1010,21 @@
 - **重放验证**: `verify_patches.sh` 的 `P23注入点1`（解析器存在）/ `P23注入点2`（`_shutdown_sessions` 走解析器）/
   `P23契约`（三步名字仍在 server.py 可见，上游改名即红）
 - **上游化状态**: 可上游（纯 bug fix，无本地语义），下一窗口随补丁集提交 PR。
+
+### P24. methods_onboarding 缺 `from pathlib import Path`（模块导入即 NameError → tests/cron 整目录收集中断）— 2026-10-19 建立（待办 488947）
+
+- **文件**: `tui_gateway/methods_onboarding.py`（+1 行 import）
+- **来源**: **上游缺陷**，且**上游已修**：`95610a5db4`（2026-10-14，「fix(onboarding): import Path in methods_onboarding (serve startup NameError)」）改的就是这一行，但该提交未进入 v0.22.2 发布标签（`git merge-base --is-ancestor 95610a5db4 v0.22.2` = 否；canary.20261017T065512Z 起才含）。裸 tag 与本地候选树同样中招 ⇒ 非移植引入。
+- **现象**: `from tui_gateway import server` 即抛
+  `NameError: name 'Path' is not defined`（`methods_onboarding.py:71`，`_shared_nous_store()` 返回注解 `tuple[Path, ...]`），模块只 `import threading`。
+  后果：任何导入 server 的测试文件收集即炸（`tests/cron/test_cron_manage_profile_scope.py`）→ pytest **整目录被中断**，夜间全量回归/定向裁决只能 `--ignore` 该文件。
+  另注：`_run_state` 里 `home = Path(_profile_home("default") ...)` 是运行期用法，故不只是注解问题，onboarding 状态路径本身也会 NameError。
+- **本次改动**: 逐字采用上游 `95610a5db4` —— `import threading` 之后加 `from pathlib import Path`。无其它改动。
+- **不变量**: 不改 onboarding 语义、返回形状、RPC 面；纯导入补全。
+- **已验（2026-10-19 22:2x，venv python 3.12.13 / pytest 9.1.1）**:
+  - 修复前 `pytest --collect-only tests/cron/test_cron_manage_profile_scope.py` → `NameError` + `Interrupted: 1 error`；
+  - 修复后同命令 `2 tests collected` rc=0，实跑 `2 passed`；
+  - `pytest --collect-only tests/cron` → **1545 tests collected, rc=0**（此前整目录中断）；
+  - `venv/bin/python -c "import tui_gateway.methods_onboarding"` → ok，`_shared_nous_store()` 返回 `(PosixPath('~/.hermes/shared/nous_auth.json'),)`。
+- **重放验证**: `verify_patches.sh` 的 `P24注入点1`（import 行在）/ `P24契约`（Path 仍被该模块使用，上游迁走或改名即红）/ `P24行为`（模块可直接导入，缺则 NameError）。
+- **退役条件**: 升级到含 95610a5db4 的 release 后本条 drop（验收：升级后 `git diff <tag> -- tui_gateway/methods_onboarding.py` 对本条为空）。无需开 PR。

@@ -95,6 +95,61 @@ _PRUNE_MARKER_NAME = ".last_prune"
 _LEDGER_MAX_ENTRIES = 2000
 
 DEFAULT_EXCLUDES = [
+    # Dependency / build output
+    "node_modules/",
+    "dist/",
+    "build/",
+    "target/",
+    "out/",
+    ".next/",
+    ".nuxt/",
+    # Caches
+    "__pycache__/",
+    "*.pyc",
+    "*.pyo",
+    ".cache/",
+    ".pytest_cache/",
+    ".mypy_cache/",
+    ".ruff_cache/",
+    "coverage/",
+    ".coverage",
+    # Virtualenvs
+    ".venv/",
+    "venv/",
+    "env/",
+    # VCS
+    ".git/",
+    ".hg/",
+    ".svn/",
+    # Worktrees (Hermes convention — don't recursively snapshot siblings)
+    ".worktrees/",
+    # Native / compiled binaries
+    "*.so",
+    "*.dylib",
+    "*.dll",
+    "*.o",
+    "*.a",
+    "*.jar",
+    "*.class",
+    "*.exe",
+    "*.obj",
+    # Media / large binaries
+    "*.mp4",
+    "*.mov",
+    "*.mkv",
+    "*.webm",
+    "*.zip",
+    "*.tar",
+    "*.tar.gz",
+    "*.tgz",
+    "*.7z",
+    "*.rar",
+    "*.iso",
+    # Secrets
+    ".env",
+    ".env.*",
+    ".env.local",
+    ".env.*.local",
     # OS junk
     ".DS_Store",
     "Thumbs.db",

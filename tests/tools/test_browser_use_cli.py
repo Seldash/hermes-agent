@@ -1062,7 +1062,7 @@ class TestBrowserExec:
         monkeypatch.setattr(bu_cli, "_endpoint_reachable", lambda url: True)
         endpoints = iter(["http://127.0.0.1:41000", "http://127.0.0.1:42000"])
 
-        def fake_route(env, session, task_id, local):
+        def fake_route(env, session, task_id, local, **kwargs):
             bu_cli._set_cdp_env(env, next(endpoints))
             return None
 
@@ -1391,7 +1391,11 @@ class TestExecHybridPrivateUrlRouting:
     def test_sidecar_route_has_its_own_daemon_and_sticks_for_url_less_calls(self):
         """The harness daemon reads BU_CDP_* once at spawn, so the sidecar must not share the cloud
         route's daemon; a follow-up with no URL literal keeps driving the page the last call opened."""
-        steps = [('new_tab("https://example.com/")', "default"),
+        # Local P22: an unnamed call gets a daemon per Hermes browser session instead of the
+        # harness's shared ``default`` (a leftover relay used to answer for every later call),
+        # so the cloud-route step names its daemon after the backend cache key.
+        cloud_daemon = bu_cli._daemon_name_for_session(bu_cli._backend_cache_key("t", ""))
+        steps = [('new_tab("https://example.com/")', cloud_daemon),
                  (f'new_tab("{self.LAN}")', "_local_default"),
                  ('print(js("document.title"))', "_local_default")]
 

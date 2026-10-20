@@ -596,8 +596,15 @@ def skill_view(
         # Disabled by declared name, or by the exact path that IS this copy's load name (a same-tier
         # duplicate's row) — whatever alias reached it; an unrelated copy at that path elsewhere is not.
         rel = _owned_relative(skill_dir, skill_md, all_dirs)
-        if _is_skill_disabled(resolved_name, rel, allow_platform_disabled=allow_platform_disabled) and (
-                _is_skill_disabled(resolved_name, allow_platform_disabled=allow_platform_disabled) or any(
+        # P13: 只在显式加载（allow=True）时才传新 kwarg —— 默认路径保持上游调用签名，
+        # 否则任何按 `_is_skill_disabled(*names, platform=…)` 签名 monkeypatch 它的调用方
+        # （上游 tests/agent/test_skill_commands.py）会因 TypeError 落到 error 体。
+        def _disabled(*names: str) -> bool:
+            if allow_platform_disabled:
+                return _is_skill_disabled(*names, allow_platform_disabled=True)
+            return _is_skill_disabled(*names)
+        if _disabled(resolved_name, rel) and (
+                _disabled(resolved_name) or any(
                     e["path"] == skill_md and e["load_name"] == rel
                     for e in _skill_catalog(skip_disabled=True, include_hidden=True))):
             return _fail(f"Skill '{resolved_name}' is disabled. Enable it with `hermes skills` or inspect the files directly on disk.")

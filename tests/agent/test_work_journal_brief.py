@@ -157,15 +157,20 @@ class WorkJournalBriefTest(unittest.TestCase):
         # 月粒度写法 YYYY-MM → 解析为该月 1 日；取次月，恒晚于 逾期(-3)、早于 远期(+60)
         next_month = (f"{base.year + 1}-01" if base.month == 12
                       else f"{base.year}-{base.month + 1:02d}")
+        # created 一律取 7 天窗口之外（2026-10-13, 台账 653694 项1）：本用例的判据是
+        # **日期档内部**的位序，而 2026-10-12 起 _journal_rank 多了 key2「近 7 天新建」档，
+        # 原先 -10/-9/-8/-7 天的 created 会让「无日期门项」独享 fresh 档而排到第一位，
+        # 用例断言的日期档位序被 freshness 档遮蔽（实测 2 子例恒红）。fresh 档的契约由
+        # tests/agent/test_work_journal_fresh_tier.py 单独锁定，本用例只钉日期档。
         todos = [
             {"id": "f00001", "task": "远期项", "status": "pending",
-             "when": future.isoformat(), "created": (base - timedelta(days=10)).isoformat()},
+             "when": future.isoformat(), "created": (base - timedelta(days=30)).isoformat()},
             {"id": "p00001", "task": "逾期项", "status": "pending",
-             "when": overdue.isoformat(), "created": (base - timedelta(days=9)).isoformat()},
+             "when": overdue.isoformat(), "created": (base - timedelta(days=29)).isoformat()},
             {"id": "m00001", "task": "月粒度项", "status": "pending", "when": next_month,
-             "created": (base - timedelta(days=8)).isoformat()},
+             "created": (base - timedelta(days=28)).isoformat()},
             {"id": "x00001", "task": "无日期门项", "status": "pending",
-             "created": (base - timedelta(days=7)).isoformat()},
+             "created": (base - timedelta(days=27)).isoformat()},
         ]
         self._write(todos)
         lines = [ln for ln in _build_work_journal_block(FakeAgent()).splitlines()

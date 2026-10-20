@@ -81,8 +81,24 @@ def _journal_due_delta(when: Any, today: date) -> Optional[int]:
         return None
 
 
-def _journal_rank(t: Dict[str, Any]) -> Tuple[int, int, int, str]:
-    """Sort key for the brief: in_progress first, then nearest due date, no-date last.
+def _journal_created_date(t: Dict[str, Any]) -> Optional[date]:
+    """``created`` 时间戳 → date（只取前导 YYYY-MM-DD）；不可解析返回 None。
+
+    2026-10-12（653694 项1）新增：``_journal_rank`` 需要「近 7 天新建」判据，而台账
+    ``created`` 是完整 ISO 时间戳（如 2026-09-25T07:12:33.123456），与 ``when`` 的自由
+    文本日期口径不同 → 单独解析、单独容错（坏的 created 只降档，不炸排序）。
+    """
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", str(t.get("created", "") or ""))
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+def _journal_rank(t: Dict[str, Any]) -> Tuple[int, int, int, int, str]:
+    """Sort key for the brief: in_progress → created within 7 days → nearest due date, no-date last.
 
     Replaces the plain file-order slice (2026-09-21, todo 144665 P0-7): once the
     journal held 100+ active items the "first 8" were always the oldest entries, so
@@ -101,8 +117,14 @@ def _journal_rank(t: Dict[str, Any]) -> Tuple[int, int, int, str]:
         bucket = 0
     else:
         bucket = 1
+    # key2「近 7 天新建」档（2026-10-12, 653694 项1）：先于日期档 —— 否则本周登记的工作
+    # 会被 8~44 天前、到期日更近的旧条目整体挤出前 12（病根：改前前 12 条最新一条也是
+    # 8 天前创建）。近 7 天档内部仍走 日期档 → delta → created，确定性不变。
+    _cd = _journal_created_date(t)
+    _fresh = 0 if (_cd is not None and (date.today() - _cd).days <= 7) else 1
     return (
         0 if t.get("status") == "in_progress" else 1,
+        _fresh,
         bucket,
         delta if delta is not None else 0,
         str(t.get("created", "")),

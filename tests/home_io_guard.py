@@ -56,7 +56,7 @@ class HomeIOGuard:
         self.checking = threading.local()
         self.directories: dict[int, Path] = {}
 
-    def check(self, value, *, dir_fd=None, metadata=False, destructive=False):
+    def check(self, value, *, dir_fd=None, metadata=False, destructive=False, follow=True):
         if value is None or isinstance(value, int) or getattr(self.checking, "active", False):
             return
         self.checking.active = True
@@ -105,6 +105,12 @@ class HomeIOGuard:
             for root in roots:
                 if _within(absolute, root):
                     self.refuse(value)
+            # ``os.unlink``/``os.remove`` never follow a symlink: deleting a link that happens
+            # to point into the real home touches the link, never its target. Resolving it
+            # used to refuse the unlink and abort ``shutil.rmtree`` of a temporary home, which
+            # then leaked the whole directory (device-flow fixtures: 1.2 GB per run).
+            if not follow:
+                return
             if resolved is None:
                 resolved = _normcase(os.path.realpath(absolute))
             if metadata and resolved in roots:
@@ -157,7 +163,7 @@ class HomeIOGuard:
         )
 
     def install(self, monkeypatch):
-        def wrap(module, name, parameters, *, metadata=False, destructive=False):
+        def wrap(module, name, parameters, *, metadata=False, destructive=False, follow=True):
             original = getattr(module, name)
 
             @wraps(original)
@@ -165,7 +171,8 @@ class HomeIOGuard:
                 for index, (parameter, descriptor) in enumerate(parameters):
                     value = args[index] if index < len(args) else kwargs.get(parameter)
                     self.check(value, dir_fd=kwargs.get(descriptor) if descriptor else None, metadata=metadata,
-                               destructive=destructive(args, kwargs) if callable(destructive) else destructive)
+                               destructive=destructive(args, kwargs) if callable(destructive) else destructive,
+                               follow=follow)
                 return original(*args, **kwargs)
 
             monkeypatch.setattr(module, name, guarded)
@@ -177,7 +184,10 @@ class HomeIOGuard:
         for module in (builtins, io):
             wrap(module, "open", (("file", None),), destructive=open_writes)
         for name in ("mkdir", "unlink", "remove", "rmdir", "chmod", "utime"):
-            wrap(os, name, (("path", "dir_fd"),), destructive=name != "mkdir")
+            # unlink/remove must not resolve: they cannot follow a symlink, so a link pointing
+            # into the real home is safe to delete (see check()'s no-follow branch).
+            wrap(os, name, (("path", "dir_fd"),), destructive=name != "mkdir",
+                 follow=name not in ("unlink", "remove"))
         for name in ("stat", "lstat", "readlink", "access"):
             wrap(os, name, (("path", "dir_fd"),), metadata=True)
         for name in ("makedirs", "listdir", "scandir"):

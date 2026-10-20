@@ -36,6 +36,7 @@
 |---|---|---|
 | baostock | 因子数据源（expand_factor_db.py / rebuild_etf_cache.py / datafeed.py 等 10 脚本） | `~/.hermes/hermes-agent/venv/bin/pip install baostock` |
 | pytest | hermes-agent 测试套件运行器（venv 重建后消失；proxy 单测等依赖） | `~/.hermes/hermes-agent/venv/bin/pip install pytest` |
+| mcp 2.2.0（+ mcp-types 2.2.0） | 修 CVE-2026-59951（GHSA-84m7-p3x7-pcfv：StreamableHTTP 服务端 stateful 会话不回收 → 内存耗尽；影响 2.0.0/2.0.1/2.1.x，修复 2.2.0）。pyproject/uv.lock 上游仍钉 `mcp==2.0.0`，**任何 uv sync / hermes update 都会把它退回 2.0.0** | `~/.hermes/hermes-agent/venv/bin/pip install 'mcp==2.2.0'` → 校验 `venv/bin/python -c "import importlib.metadata as md;print(md.version('mcp'))"` 应为 2.2.0 |
 
 - 事故记录（2026-08-24）：hermes update 07:28 uv sync 重建 253 包，清除手动安装的 baostock
   → 08:20 因子·全市场覆盖扩展 / 09:05 因子·ETF缓存刷新 ModuleNotFoundError。

@@ -185,10 +185,17 @@ from types import SimpleNamespace
 
 
 def _fake_response(status, url, body):
-    """A minimal stand-in for the httpx.Response the SDK feeds our bridge."""
+    """A minimal stand-in for the httpx.Response the SDK feeds our bridge.
+
+    mcp >= 2.2 inspects ``response.request.method`` and ``response.next_request``
+    in ``next_request_within_origin`` (same-origin redirect handling), so the
+    stand-in models a request with no redirect instead of leaving MagicMock
+    attributes in place.
+    """
     resp = MagicMock()
     resp.status_code = status
-    resp.request = SimpleNamespace(url=url)
+    resp.request = SimpleNamespace(url=url, method="POST")
+    resp.next_request = None
 
     async def _aread():
         return body

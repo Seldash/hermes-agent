@@ -265,6 +265,18 @@ for _provider, _url, _version, _rows in _SNAPSHOTS:
             _OFFICIAL_DOCS_PRICING[(_provider, _model)] = _entry
 del _SNAPSHOTS, _provider, _url, _version, _rows, _models, _rates, _entry, _model
 
+# Moonshot K3（fallback 链第 3 跳）官方定价：¥20 输入 / ¥100 输出 / ¥2 缓存命中 每百万 token
+# ≈ $2.80 / $14.00 / $0.28。缺这一行时该模型每次调用落 cost_status=unknown、
+# estimated_cost_usd=0（2026-10-20 实测：当日 80 次降级调用、7.6M 缓存读全部未入账）。
+# 三个 provider 写法都登记，防 billing_provider 别名漂移（配置名 kimi-coding-cn）。
+for _k3_provider in ("kimi-coding-cn", "moonshot", "moonshot-cn"):
+    _OFFICIAL_DOCS_PRICING[(_k3_provider, "kimi-k3")] = _snap(
+        "2.80", "14.00", "0.28",
+        url="https://platform.moonshot.cn/docs/pricing",
+        version="moonshot-kimi-k3-2026-09",
+    )
+del _k3_provider
+
 # GPT-6 Astra uses whole-request pricing above the 272K prompt tier.  Keep this
 # account-gated model out of generic static catalogs, but retain published billing
 # metadata for an explicitly selected route.

@@ -1029,3 +1029,14 @@
   - `venv/bin/python -c "import tui_gateway.methods_onboarding"` → ok，`_shared_nous_store()` 返回 `(PosixPath('~/.hermes/shared/nous_auth.json'),)`。
 - **重放验证**: `verify_patches.sh` 的 `P24注入点1`（import 行在）/ `P24契约`（Path 仍被该模块使用，上游迁走或改名即红）/ `P24行为`（模块可直接导入，缺则 NameError）。
 - **退役条件**: 升级到含 95610a5db4 的 release 后本条 drop（验收：升级后 `git diff <tag> -- tui_gateway/methods_onboarding.py` 对本条为空）。无需开 PR。
+
+### P25. kimi-k3 价格登记（fallback 第 3 跳用量此前落 `cost_status=unknown` / `$0`）— 2026-10-20 建立（待办 340309）
+
+- **文件**: `agent/usage_pricing.py`（+13 行：`_OFFICIAL_DOCS_PRICING` 补 `kimi-k3` 三条别名登记）
+- **来源**: 上游价格表缺项（非本站语义）—— `_SNAPSHOTS` 里 Moonshot/Fireworks 家只有 `kimi-k2p6` / `kimi-k2p7-code` / `-fast` 系列，**无 `kimi-k3`**；本机配置里的 provider 名 `kimi-coding-cn` 同样未登记。
+- **现象**: 2026-10-20 10:35 家宽上游断 3.2 分钟 → 级联 fallback 到第 3 跳 kimi-k3；当日 `session_model_usage` 中 4 行 kimi-k3（合计 80 次调用、9,945 输入、7,592,424 缓存读、48,776 输出）全部 `cost_status=unknown` / `cost_source=none` / `estimated_cost_usd=0.0` ⇒ **降级成本在账上完全不可见**，按官方 ¥20/¥100/¥2 应计 ≈¥20.3（$2.84）。
+- **本次改动**: `del _SNAPSHOTS, ...` 之后新增循环，对 `kimi-coding-cn` / `moonshot` / `moonshot-cn` 三个 provider 别名各登记一条 `kimi-k3`，价格为 USD per M token `2.80 / 14.00 / 0.28`（¥20/¥100/¥2 ÷ 7.15），`version="moonshot-kimi-k3-2026-09"`。
+- **不变量**: 只新增价格条目，不改解析顺序、不改 `estimate_usage_cost` 逻辑、不动 `cost_tracker_pricing.PRICING`（脚本侧口径另有一份，两处均已含 kimi-k3）。
+- **已验（2026-10-20 11:1x，venv python）**: `estimate_usage_cost("kimi-k3", CanonicalUsage(9945/48776/7592424), provider="kimi-coding-cn", base_url=...)` → `status=estimated`、`source=official_docs_snapshot`、`amount_usd=2.83658872`、`pricing_version=moonshot-kimi-k3-2026-09`；`moonshot-cn` 同值。改前同调用返回 `unknown/0`。
+- **重放验证**: `verify_patches.sh` 的 `P25注入点`（登记行在）/ `P25价格版本`（价格快照版本在，兼作回算对账锚点）。
+- **退役条件**: 上游 `agent/usage_pricing.py` 自带 `kimi-k3` 后 drop（验收：`git diff <tag> -- agent/usage_pricing.py` 对本条为空）；在此之前可提 PR 上游化（`pr_candidate=True`）。

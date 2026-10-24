@@ -277,6 +277,22 @@ for _k3_provider in ("kimi-coding-cn", "moonshot", "moonshot-cn"):
     )
 del _k3_provider
 
+# Moonshot K3.1 Pro（2026-10-24 发布）：¥13 输入 / ¥68 输出 / ¥1.3 缓存命中 每百万 token
+# ≈ $1.82 / $9.52 / $0.18；高速版 2x（¥26 / ¥136 / 命中同价）。K3.1 Pro 单价低于 K3，
+# 不登记会落到 kimi 家族量级之外 → 该模型用量仍记 cost_status=unknown（$0）。
+for _k31_provider in ("kimi-coding-cn", "moonshot", "moonshot-cn"):
+    _OFFICIAL_DOCS_PRICING[(_k31_provider, "kimi-k3.1-pro")] = _snap(
+        "1.82", "9.52", "0.18",
+        url="https://platform.moonshot.cn/docs/pricing/chat",
+        version="moonshot-kimi-k3.1-pro-2026-10",
+    )
+    _OFFICIAL_DOCS_PRICING[(_k31_provider, "kimi-k3.1-pro-highspeed")] = _snap(
+        "3.64", "19.04", "0.18",
+        url="https://platform.moonshot.cn/docs/pricing/chat",
+        version="moonshot-kimi-k3.1-pro-2026-10",
+    )
+del _k31_provider
+
 # GPT-6 Astra uses whole-request pricing above the 272K prompt tier.  Keep this
 # account-gated model out of generic static catalogs, but retain published billing
 # metadata for an explicitly selected route.

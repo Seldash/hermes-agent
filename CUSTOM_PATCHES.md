@@ -1040,3 +1040,11 @@
 - **已验（2026-10-20 11:1x，venv python）**: `estimate_usage_cost("kimi-k3", CanonicalUsage(9945/48776/7592424), provider="kimi-coding-cn", base_url=...)` → `status=estimated`、`source=official_docs_snapshot`、`amount_usd=2.83658872`、`pricing_version=moonshot-kimi-k3-2026-09`；`moonshot-cn` 同值。改前同调用返回 `unknown/0`。
 - **重放验证**: `verify_patches.sh` 的 `P25注入点`（登记行在）/ `P25价格版本`（价格快照版本在，兼作回算对账锚点）。
 - **退役条件**: 上游 `agent/usage_pricing.py` 自带 `kimi-k3` 后 drop（验收：`git diff <tag> -- agent/usage_pricing.py` 对本条为空）；在此之前可提 PR 上游化（`pr_candidate=True`）。
+
+#### 2026-10-24 扩展：K3.1 Pro 同批登记（同一补丁，不新建 P 号）
+
+- **触发**: Kimi K3.1 Pro 发布（2026-10-24），实测 `kimi-k3.1-pro` / `kimi-k3.1-pro-highspeed` 调用全部落 `cost_status=unknown`（`--usage-file` 与 `session_model_usage` 双证）。
+- **新增**: 同三个 provider 别名各补 `kimi-k3.1-pro`（`1.82 / 9.52 / 0.18` USD per M）与 `kimi-k3.1-pro-highspeed`（`3.64 / 19.04 / 0.18`），`version="moonshot-kimi-k3.1-pro-2026-10"`。官方人民币价 ¥13/¥68/¥1.3 与 ¥26/¥136/¥1.3（缓存写入另计：13@5min、26@1h）。
+- **配套（仓库外）**: `scripts/cost_tracker_pricing.py` 同步登记两条（报表成本口径 SSOT），并把「同族版本后缀」最长前缀匹配从仅 `qwen` 扩到 `qwen/kimi/moonshot` —— 否则快照名（`kimi-k3.1-pro-<日期>`）会回落 `kimi` 家族档 20/100，高估 1.54x。
+- **重放验证**: 新增 `P25K3.1价格`（登记行 + 快照版本同时存在）。
+- **已知生效滞后**: 本补丁在 `~/.hermes/hermes-agent` 树内，**live 运行树 `~/.hermes/installs/<id>/environments/<id>/workspace` 仍是旧版（10-19 构建，早于 P25）** → 在下次 install 重建/升级前，K3.1 Pro 的运行期 `cost_status` 仍为 unknown；报表口径走 `cost_tracker_pricing.py`（已即时生效），不受此滞后影响。

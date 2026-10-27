@@ -729,26 +729,33 @@
 - **升级注意**: 上游 provider 若重写配额逻辑，保留「results 口径 + 月字段跨日保留」两条语义；
   看门狗 `scripts/bocha_balance_watch.py` 依赖字段名 `monthly_results`
 
-### P16. work journal 三件套（A1 注入 + B1 todo 桥 + brief 排序）— 2026-08-21 建 / 08-29 恢复 / 09-21 迭代
+### P16. work journal 三件套 — **已退役（2026-10-23 外移插件，核心零补丁）**
 
-- **文件**: `agent/system_prompt.py`（`_build_work_journal_block` + volatile 注入 + `_journal_due_delta`）、
-  `agent/agent_init.py`（`work_journal_inject` / `work_journal_max_items` / `todo_mirror_to_journal` 三项门控）、
-  `agent/inline_tool_executors.py`（`mirror_builtin_todos` 调用点）、`agent/todo_journal_bridge.py`（新模块，
-  上游无同名文件）+ 测试 `tests/agent/test_work_journal_brief.py`、`tests/agent/test_todo_journal_bridge.py`
-- **背景**: 08-24 reset 事故丢失、08-29 从 `4653e87fd` 提取重放（`ee47fb14a`），曾静默失效数日；
-  09-21 迭代「按 进行中→到期日近者 排序取前 N」+ 缺年 `MM-DD` 支持（`ec4085ed3a`/`3c21a4e324`/`41951d8303`）
-- **⚠️ 分派点搬迁（v0.21.1）**: todo 分派已迁到 `agent/inline_tool_executors.py`，旧 `agent_runtime_helpers.py`
-  的 `invoke_tool` 分支为**死代码** → 注入点检查盯 inline_tool_executors（见 git-patch-replay 陷阱 11）
-- **重放验证**: `verify_patches.sh` 的 `P16注入点1/2/3`
-- **2026-10-18 迭代（注入块形状）**: `_build_work_journal_block` 增四项 —
-  ① 顶部「📌 截至 <时点>」+ `wj-handoff` 交接入口（原块无时点，无法判快照年龄）；
-  ② `kind=decision` 行尾标 `⚖️决策`（原与执行项同形，603482/926304 是等用户拍板的）；
-  ③ 表外行改「表外到期/逾期 N 条（逾期 a · 今日 b）」——原「表外已逾期」把 d==0 也算逾期
-  （实测 14 = 5 真逾期 + 9 今日）；④ id 上限 8 → 20（原第 9 条起无入口，实测藏 6 条含 2 条决策）。
-  同步测试 `tests/agent/test_work_journal_overdue_line.py`（新增 4 例，锁决策标注/拆分口径/不截断/时点）。
-  **重放要点**: 除函数体，`verify_patches.sh` 的 `P16注入点4` 会检查 `表外到期/逾期` 与 `⚖️决策` 两个标记。
-- **升级注意**: 上游提供 `plugins/hooks` 扩展点；本项属本站特性，评估改走 hook 以永久退出 core
-  （可一次消掉 system_prompt / agent_init / inline_tool_executors 三个高频文件的补丁面）
+- **现宿主**: `~/.hermes/plugins/work_journal/`（用户插件，仓库外；`plugin.yaml` + `brief.py` +
+  `bridge.py` + `tests/`），`config.yaml` 的 `plugins.enabled` 含 `work_journal`。
+- **原补丁面（已全部撤销，三个文件与 `v0.22.2` 逐字节一致）**:
+  `agent/system_prompt.py`（`_build_work_journal_block` / `_journal_due_delta` / `_journal_rank` /
+  `_journal_suspended` + `_memory_parts` 里的注入调用）、`agent/agent_init.py`（三项配置门控）、
+  `agent/inline_tool_executors.py`（`_todo_list` 尾巴的 `mirror_builtin_todos` 调用）；
+  新模块 `agent/todo_journal_bridge.py` 与 `tests/agent/test_work_journal_*.py` /
+  `test_todo_journal_bridge.py` 已删除（测试随宿主迁到插件 `tests/`，33 例全绿）。
+- **外移依据**: 上游 v0.21.5+ 提供 `register_system_prompt_section(id, content|callable,
+  position=, max_chars=)`（位置仅 `after_memory`，落在 volatile tier）与 `post_tool_call` hook；
+  ① 注入块 → 插件 section（`max_chars=4000`，超限是**整块跳过**而非截断，故留 90% 告警线）；
+  ② todo 镜像 → `post_tool_call`（数据取自 `todo_list` 工具结果本身，不再需要 agent 对象）。
+- **等价性证据（2026-10-23 实测）**: 同一 journal 下插件渲染与核心版**逐字节相同**（1256 chars）；
+  真会话（oneshot `20261023_143431_52bcf7d`）落库 prompt 中该块**只出现 1 次**、带
+  `## Plugin Context: work-journal` 框、位于 memory 之后（`position=after_memory`）、
+  正文与退役前同口径（仅「📌 截至」时点不同）。journal 写入侧（锁/原子替换/`builtin_todos`
+  段/`updated_at`）与核心版一致，主 `todos` 数组仍不动。
+- **配置键不变**（`agent.work_journal_inject` / `agent.work_journal_max_items` /
+  `agent.todo_mirror_to_journal`），改配置仍需重启承载进程（插件发现按进程缓存）。
+- **验证**: `verify_patches.sh` 的 `P16退出1/2/3`（核心不得回潮）+ `P16宿主1/2/3/4`
+  （宿主存在、已启用、形状标记未丢、可导入）。回归：`~/.hermes/plugins/work_journal/tests`。
+- **回滚**: 见 `~/.hermes/plugins/work_journal/README-rollback.md`（摘 `plugins.enabled` +
+  从 `v0.22.2` 反向重放三个文件 hunk）。
+- **历史**: 2026-08-21 建 / 08-29 事故后恢复（`ee47fb14a`）/ 09-21 排序迭代 / 10-12「近 7 天新建」档 /
+  10-18 注入块形状四项 / 10-20 排序档被升级吞块（`P16排序档` 检查由此而来）—— 教训已随测试迁入插件。
 
 ### P17. session_search 覆盖面对账（取消 limit 截断）— 2026-09-19 建立
 
@@ -1048,3 +1055,30 @@
 - **配套（仓库外）**: `scripts/cost_tracker_pricing.py` 同步登记两条（报表成本口径 SSOT），并把「同族版本后缀」最长前缀匹配从仅 `qwen` 扩到 `qwen/kimi/moonshot` —— 否则快照名（`kimi-k3.1-pro-<日期>`）会回落 `kimi` 家族档 20/100，高估 1.54x。
 - **重放验证**: 新增 `P25K3.1价格`（登记行 + 快照版本同时存在）。
 - **已知生效滞后**: 本补丁在 `~/.hermes/hermes-agent` 树内，**live 运行树 `~/.hermes/installs/<id>/environments/<id>/workspace` 仍是旧版（10-19 构建，早于 P25）** → 在下次 install 重建/升级前，K3.1 Pro 的运行期 `cost_status` 仍为 unknown；报表口径走 `cost_tracker_pricing.py`（已即时生效），不受此滞后影响。
+
+### P26. 桌面端 GPU 兜底两条自旋盲区（占位版本锁死 SwiftShader + GPU 子进程存活≠健康）— 2026-10-23 建立（待办 398478）
+
+- **文件**:
+  - `apps/desktop/electron/linux-nvidia-egl-fallback.ts`（+`resolveInformativeAppVersion` / `isPlaceholderAppVersion`；`decideNvidiaEglFallback` 的 sticky 判据改为「同一可识别构建」）
+  - `apps/desktop/electron/linux-gpu-fallback.ts`（+`GPU_CHILD_SPIN_CPU_PERCENT`；`shouldEngageSilentGpuRetryFallback` 增 `gpuCpuPercent` 维度）
+  - `apps/desktop/electron/main.ts`（`DESKTOP_APP_VERSION` 解析器接线 6 处 marker 读写；静默重试检测去掉 NVIDIA 软件路由短路 + 采 `gpu` metric 的 `percentCPUUsage`）
+  - 测试: `apps/desktop/electron/linux-nvidia-egl-fallback.test.ts`（+6 条）、`linux-gpu-fallback.test.ts`（+1 条）
+- **现象（2026-10-23 15:20 实测）**: 桌面端一个 `--type=zygote` 子进程 27 线程 **1013% CPU**（`Thread<00..15>` 各 ~60% 核，`utime` 368715 tick / 517s，`cutime=0` ⇒ 自身线程自旋，非 fork 风暴），load 13.5；全机 `--type=gpu-process` **0 个**。`362095` maps 内含 `libvk_swiftshader.so` + `/memfd:swiftshader_jit`，而线程名格式串 `Thread<%.2d>` 只存在于 `libvk_swiftshader.so` ⇒ 正在自旋的是 **SwiftShader 的线程池**。重启无效。
+- **根因链**:
+  ① `~/.config/Hermes/nvidia-egl-fallback.json` = `{"state":"fallback","version":"0.0.0","driverVersion":"580.178.04"}` → 应用启动 `appendSwitch('use-angle','swiftshader')`；
+  ② 打包产物的 `app.getVersion()` 恒为 `0.0.0`（`apps/desktop/package.json` version=0.0.0，launcher `version` 文件才是 40.10.20.0.0），而 sticky 判据是 `marker.version === appVersion` ⇒ **「应用升级后重探一次」的出口永不成立**，一次见证过的 GPU 死亡把 ANGLE 永久钉在软件栈；
+  ③ 软件栈本身中了上游 #124843（sub-zygote 无限重试 GPU 初始化），但该保守底检测在 `main.ts` 里被 `alreadySoftware` 短路（`LINUX_GPU_SOFTWARE_ACTIVE` 含 `NVIDIA_EGL_FALLBACK.enable`），且判据只看「有没有 `gpu` metric」——自旋的 sub-zygote 正好**被报成 `gpu`** ⇒ `linux-gpu-fallback.json` 落 `ok`，两条兜底同时失效，自旋无人收敛。
+- **本次改动**: ① 版本门改用 `resolveInformativeAppVersion()`（`app.getVersion()` → 可执行文件旁 `version` 文件 → `app.asar` size+mtime），占位版本一律不得保持 sticky；② 静默重试判据加入持续 CPU 维度（`>= 200%` 单核即判定自旋）并把 NVIDIA SwiftShader 路由从「已软件化」里剔除。仍保持「一次性、按构建/驱动版本重探」的原有语义。
+- **不变量**: 不动 `--no-sandbox`/`--disable-gpu` 阶梯与 relaunch 次数上限；不改 `shouldRelaunchForNvidiaGpuDeath` / `linuxGpuChildDeathPath` 的死亡原因集合；健康机（硬件 GL，GPU 子进程 CPU 个位数）判定不变——`gpuCpuPercent` 缺省 0 时与原行为一致。
+- **已验红绿**: 红线 = HEAD 源码 + 两条新行为断言（占位版本 sticky 应为 `false`、`gpuCpuPercent=1013` 应 engage）→ `2 failed`；改后同文件 `3 passed (56 tests)`。`tsc --build tsconfig.electron.json` rc=0。`portal-session-live.test.ts` 1 条在 BASE 与补丁后**同样失败**（真实 portal 窗口，环境性，非本项引入）。
+- **重放验证**: `verify_patches.sh` 的 `P26注入点1/2/3`。
+- **生效条件**: 改的是随包分发的 `electron-main` → 需重新打包（`npm run build` + electron-builder）并重启桌面端；**未重打包前对本机不生效**，本机当日以 `HERMES_DESKTOP_NVIDIA_SWIFTSHADER=0` + marker 复位为准（见待办）。
+- **退役条件**: 上游 `linux-nvidia-egl-fallback.ts` / `linux-gpu-fallback.ts` 自带同等判据（验收：`git diff <tag> -- <两文件>` 对本条为空）。闸门 `frozen`（在途/净增超限）⇒ `PR_INTENT="blocked"`，不开 PR。
+
+### P27. 运行时依赖 pin 与实装版本对齐（Pillow / certifi / packaging / PyJWT）
+
+- **触发**: 2026-10-25 安全升级（wj 890409）把运行时 Pillow 12.3.0→13.0.0、certifi 2026.7.22→2026.10.23，回写时 `pip check` 报 4 条 pin 冲突；此前 certifi/packaging/PyJWT 三条冲突已存在。pin 与实际脱钩有两个现实后果: ① `pip check` 长期红污染打包健康读数; ② `pip install -e .`（升级流程会走）会把 Pillow 静默降回 12.3.0，把 24 条公告（含 CVE-2026-112390~93）带回来。
+- **改动**（`pyproject.toml`，4 行）: `Pillow==12.3.0→13.0.0`、`certifi==2026.5.20→2026.10.23`、`packaging==26.0→26.2`、`PyJWT[crypto]==2.13.0→2.15.0`。只改 pin，不动依赖树、不动代码。
+- **验证**: `venv/bin/python -m pip check` 无输出（rc=0）；Pillow 13 依赖面实测 ImageDraw+TTF 中文、PNG/JPEG 存读、matplotlib savefig、weasyprint 出 PDF、python-pptx add_picture、pdf2image/pytesseract import 全通；filelock 4.2.4 跨进程互斥实测（两进程抢同一锁，事件序 IN/OUT/IN/OUT）。
+- **重放验证**: `verify_patches.sh` 的 `P27注入点`（4 条 pin 同时在位）。
+- **退役条件**: 上游把 4 个 pin 抬到 ≥ 本仓运行时版本后 drop（验收: `git diff <tag> -- pyproject.toml` 对本条为空）；`pr_candidate=True`，受 C3 闸门冻结先本地 carry。

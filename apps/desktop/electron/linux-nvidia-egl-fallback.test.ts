@@ -6,12 +6,14 @@ import { afterEach, describe, expect, it } from 'vitest'
 
 import {
   decideNvidiaEglFallback,
+  isPlaceholderAppVersion,
   NVIDIA_GPU_DEATH_REASONS,
   nvidiaEglFallbackMarker,
   nvidiaEglMarkerAfterSuccessfulBoot,
   parseNvidiaDriverMajor,
   parseNvidiaDriverVersion,
   readNvidiaEglMarker,
+  resolveInformativeAppVersion,
   shouldRelaunchForNvidiaGpuDeath,
   writeNvidiaEglMarker
 } from './linux-nvidia-egl-fallback'
@@ -92,6 +94,18 @@ describe('decideNvidiaEglFallback — behavioral probe', () => {
   it('a driver update re-probes hardware GL once', () => {
     const marker = nvidiaEglFallbackMarker('0.21.5', '580.178.04')
     const decision = decideNvidiaEglFallback({ ...PROBE, marker, driverVersion: '580.182.10' })
+
+    expect(decision.enable).toBe(false)
+    expect(decision.nextMarker.state).toBe('booting')
+  })
+
+  it('a placeholder app version cannot hold the fallback sticky (packed builds report 0.0.0)', () => {
+    // Regression: a packed build whose app.getVersion() is 0.0.0 never
+    // satisfies the "app updated" escape hatch, so one witnessed GPU death
+    // pinned ANGLE to SwiftShader for the life of the install — and the
+    // software path then burned ~11 cores in the #124843 retry loop.
+    const marker = nvidiaEglFallbackMarker('0.0.0', '580.178.04')
+    const decision = decideNvidiaEglFallback({ ...PROBE, appVersion: '0.0.0', marker })
 
     expect(decision.enable).toBe(false)
     expect(decision.nextMarker.state).toBe('booting')
@@ -224,5 +238,73 @@ describe('marker persistence', () => {
         driverVersion: '580.178.04'
       })
     ).toEqual(nvidiaEglFallbackMarker('0.21.5', '580.178.04'))
+  })
+})
+
+describe('resolveInformativeAppVersion', () => {
+  it('flags the placeholder versions a packed build reports', () => {
+    expect(isPlaceholderAppVersion('')).toBe(true)
+    expect(isPlaceholderAppVersion('0.0.0')).toBe(true)
+    expect(isPlaceholderAppVersion('  0.0.0.0 ')).toBe(true)
+    expect(isPlaceholderAppVersion('0.21.5')).toBe(false)
+    expect(isPlaceholderAppVersion('40.10.20.0.0')).toBe(false)
+  })
+
+  it('uses app.getVersion() when it is informative', () => {
+    const resolved = resolveInformativeAppVersion({
+      getVersion: () => '40.10.20.0.0',
+      execPath: '/opt/hermes/Hermes',
+      readFileSync: () => {
+        throw new Error('must not read the version file')
+      }
+    })
+
+    expect(resolved).toBe('40.10.20.0.0')
+  })
+
+  it('falls back to the launcher version file when the app reports a placeholder', () => {
+    const seen: string[] = []
+    const resolved = resolveInformativeAppVersion({
+      getVersion: () => '0.0.0',
+      execPath: '/opt/hermes/Hermes',
+      readFileSync: file => {
+        seen.push(file)
+
+        return '40.10.20.0.0\n'
+      }
+    })
+
+    expect(resolved).toBe('40.10.20.0.0')
+    expect(seen).toEqual(['/opt/hermes/version'])
+  })
+
+  it('falls back to the packaged bundle identity when no version is stamped', () => {
+    const resolved = resolveInformativeAppVersion({
+      getVersion: () => '',
+      execPath: '/opt/hermes/Hermes',
+      readFileSync: () => '0.0.0',
+      statSync: file => {
+        expect(file).toBe('/opt/hermes/resources/app.asar')
+
+        return { mtimeMs: 1792740000000, size: 8791092 }
+      }
+    })
+
+    expect(resolved).toBe('bundle-8791092-1792740000000')
+  })
+
+  it('degrades to unknown instead of throwing when nothing is readable', () => {
+    const resolved = resolveInformativeAppVersion({
+      getVersion: () => '',
+      execPath: '/opt/hermes/Hermes',
+      readFileSync: () => {
+        throw new Error('EACCES')
+      },
+      statSync: () => {
+        throw new Error('ENOENT')
+      }
+    })
+
+    expect(resolved).toBe('unknown')
   })
 })

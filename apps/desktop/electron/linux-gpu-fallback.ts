@@ -42,6 +42,15 @@ export const BOOT_ABORTS_BEFORE_LINUX_GPU_FALLBACK = 2
  */
 export const LINUX_GPU_SILENT_RETRY_GRACE_S = 30
 
+/**
+ * Sustained CPU of the `gpu` child that marks it as spinning rather than
+ * compositing, as a percent of one core (Electron's `percentCPUUsage` unit).
+ * A healthy GPU child sits in single digits with hardware compositing and
+ * under ~80 with SwiftShader software compositing; the #124843 retry loop
+ * spins its whole thread pool and lands in the high hundreds to ~1000.
+ */
+export const GPU_CHILD_SPIN_CPU_PERCENT = 200
+
 /** `child-process-gone` reasons that witness a broken GPU child. */
 const GPU_FAILURE_REASONS = new Set(['crashed', 'launch-failure'])
 
@@ -376,12 +385,22 @@ export function disableGpuSwitchNeededForReason(remoteDisplayReason: string | nu
  * no `child-process-gone` event ever fires. N seconds after the main window
  * reveals, the absence of a `--type=gpu-process` child on a boot that was
  * supposed to have one means the retry loop is running: engage the sticky
- * software fallback. A GPU child present, a non-Linux host, software already
- * on, or the check run before the grace window elapsed all decline.
+ * software fallback.
+ *
+ * A GPU child *present* is not proof of health: when ANGLE is routed through
+ * SwiftShader (#40077) the retrying sub-zygote is still reported as a `gpu`
+ * metric while its thread pool spins, so the same loop hides behind a live
+ * child. `gpuCpuPercent` is the discriminator — sustained CPU far above a
+ * healthy compositor means the child is spinning, not compositing.
+ *
+ * A non-Linux host, software rendering already on, or the check run before the
+ * grace window elapsed all decline.
  */
 export function shouldEngageSilentGpuRetryFallback(options: {
   platform?: NodeJS.Platform | string
   gpuChildPresent?: boolean
+  /** Sustained CPU of the `gpu` child, percent of one core (100 = one core). */
+  gpuCpuPercent?: number
   graceElapsed?: boolean
   alreadySoftware?: boolean
 }): boolean {
@@ -389,9 +408,15 @@ export function shouldEngageSilentGpuRetryFallback(options: {
     return false
   }
 
-  if (options.alreadySoftware || !options.graceElapsed || options.gpuChildPresent) {
+  if (options.alreadySoftware || !options.graceElapsed) {
     return false
   }
 
-  return true
+  if (!options.gpuChildPresent) {
+    return true
+  }
+
+  const cpuPercent = Number(options.gpuCpuPercent ?? 0)
+
+  return Number.isFinite(cpuPercent) && cpuPercent >= GPU_CHILD_SPIN_CPU_PERCENT
 }

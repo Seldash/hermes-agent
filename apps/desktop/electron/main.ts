@@ -358,6 +358,7 @@ import {
   parseNvidiaDriverMajor,
   parseNvidiaDriverVersion,
   readNvidiaEglMarker,
+  resolveInformativeAppVersion,
   shouldRelaunchForNvidiaGpuDeath,
   writeNvidiaEglMarker
 } from './linux-nvidia-egl-fallback'
@@ -887,6 +888,15 @@ const NVIDIA_PROC_VERSION = (() => {
 const NVIDIA_DRIVER_MAJOR = parseNvidiaDriverMajor(NVIDIA_PROC_VERSION)
 const NVIDIA_DRIVER_VERSION = parseNvidiaDriverVersion(NVIDIA_PROC_VERSION)
 
+// Sticky GPU-fallback markers are keyed on the build identity, so the escape
+// hatch ("an app update re-probes hardware GL once") must actually fire.
+// Packed/unpacked builds report `0.0.0` from app.getVersion(); resolve a real
+// value instead of pinning software rendering for the life of the install.
+const DESKTOP_APP_VERSION = resolveInformativeAppVersion({
+  getVersion: () => app.getVersion(),
+  execPath: process.execPath
+})
+
 let nvidiaEglFallbackActive = false
 let nvidiaEglRelaunchAttempted = false
 
@@ -894,7 +904,7 @@ const NVIDIA_EGL_FALLBACK = decideNvidiaEglFallback({
   driverMajor: NVIDIA_DRIVER_MAJOR,
   driverVersion: NVIDIA_DRIVER_VERSION,
   marker: readNvidiaEglMarker(app.getPath('userData')),
-  appVersion: app.getVersion(),
+  appVersion: DESKTOP_APP_VERSION,
   env: process.env,
   platform: process.platform,
   isWsl: IS_WSL,
@@ -989,7 +999,7 @@ if (process.platform === 'linux') {
     argv: process.argv,
     env: process.env,
     marker: readLinuxGpuMarker(linuxGpuUserData),
-    appVersion: app.getVersion(),
+    appVersion: DESKTOP_APP_VERSION,
     remoteDisplayReason: REMOTE_DISPLAY_REASON,
     nvidiaFallbackActive: NVIDIA_EGL_FALLBACK.enable
   })
@@ -1189,7 +1199,7 @@ if (IS_WINDOWS || process.platform === 'linux') {
         String(details?.reason || '').toLowerCase() === 'launch-failure' ? 'gpu-launch-failure' : 'gpu-crash'
 
       try {
-        writeLinuxGpuMarker(app.getPath('userData'), linuxGpuFallbackMarker(reason, app.getVersion()))
+        writeLinuxGpuMarker(app.getPath('userData'), linuxGpuFallbackMarker(reason, DESKTOP_APP_VERSION))
       } catch {
         void 0
       }
@@ -15094,7 +15104,7 @@ function createWindow() {
             app.getPath('userData'),
             nvidiaEglMarkerAfterSuccessfulBoot({
               fallbackActive: nvidiaEglFallbackActive,
-              appVersion: app.getVersion(),
+              appVersion: DESKTOP_APP_VERSION,
               driverVersion: NVIDIA_DRIVER_VERSION
             })
           )
@@ -15144,7 +15154,7 @@ function createWindow() {
             app.getPath('userData'),
             linuxGpuMarkerAfterSuccessfulBoot({
               fallbackActive: linuxGpuFallbackSticky,
-              appVersion: app.getVersion()
+              appVersion: DESKTOP_APP_VERSION
             })
           )
         } catch (error) {
@@ -15160,19 +15170,31 @@ function createWindow() {
         // already applied pre-ready and cannot change now).
         if (!linuxGpuFallbackSticky) {
           const checkSilentGpuRetry = (): void => {
+            // Only real software rendering rules the spin out. The NVIDIA
+            // SwiftShader route is deliberately excluded: it composites in
+            // software but still owns a `gpu` child whose init can spin
+            // (#124843 on top of #40077 — same host, same boot), which is
+            // exactly the case this check has to bound.
             const alreadySoftware =
-              LINUX_GPU_SOFTWARE_ACTIVE ||
-              linuxGpuFallbackActive ||
+              Boolean(REMOTE_DISPLAY_REASON) ||
               alreadyHasDisableGpu(process.argv, process.env) ||
               isHermesDesktopGpuOverrideOff(process.env)
 
-            const gpuChildPresent = app
+            const gpuMetrics = app
               .getAppMetrics()
-              .some(metric => String(metric?.type || '').toLowerCase() === 'gpu')
+              .filter(metric => String(metric?.type || '').toLowerCase() === 'gpu')
+            const gpuChildPresent = gpuMetrics.length > 0
+            // A live `gpu` child is not proof of health: the retrying
+            // sub-zygote is reported as one while its thread pool spins.
+            const gpuCpuPercent = gpuMetrics.reduce(
+              (max, metric) => Math.max(max, Number(metric?.cpu?.percentCPUUsage ?? 0) || 0),
+              0
+            )
 
             if (
               shouldEngageSilentGpuRetryFallback({
                 gpuChildPresent,
+                gpuCpuPercent,
                 graceElapsed: true,
                 alreadySoftware
               })
@@ -15183,7 +15205,7 @@ function createWindow() {
               try {
                 writeLinuxGpuMarker(
                   app.getPath('userData'),
-                  linuxGpuFallbackMarker('gpu-launch-failure', app.getVersion())
+                  linuxGpuFallbackMarker('gpu-launch-failure', DESKTOP_APP_VERSION)
                 )
               } catch {
                 void 0

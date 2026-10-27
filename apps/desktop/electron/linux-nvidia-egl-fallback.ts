@@ -156,6 +156,75 @@ export function parseNvidiaDriverVersion(procVersion: string): string | null {
   return match ? match[1] : null
 }
 
+/**
+ * Version strings that carry no build identity. `app.getVersion()` returns
+ * these for builds whose package.json is stamped at install time (bundled /
+ * unpacked releases): every build then looks identical, so a sticky marker
+ * keyed on it can never expire.
+ */
+const PLACEHOLDER_APP_VERSIONS = new Set(['', '0.0.0', '0.0.0.0', '0.0.0-0', 'unknown', 'null', 'undefined'])
+
+export function isPlaceholderAppVersion(version: string | null | undefined): boolean {
+  return PLACEHOLDER_APP_VERSIONS.has(String(version ?? '').trim().toLowerCase())
+}
+
+/**
+ * Build identity used by the sticky-marker version gate.
+ *
+ * A sticky SwiftShader fallback is only correct while the build that witnessed
+ * the GPU death is the build that keeps seeing it: the escape hatch is "an app
+ * update re-probes hardware GL once". When `app.getVersion()` is a placeholder
+ * (`0.0.0`) that escape hatch never opens, so one witnessed death pins ANGLE
+ * to software rendering for the life of the install — and the software path
+ * itself can then burn cores (#124843 spin inside the sub-zygote).
+ *
+ * Resolution order: `app.getVersion()` → the launcher's `version` file next to
+ * the executable (electron-builder writes the real app version there) → the
+ * packaged `app.asar` size+mtime, so any real update changes the key.
+ */
+export function resolveInformativeAppVersion(
+  options: {
+    getVersion?: () => string
+    execPath?: string
+    readFileSync?: (file: string, encoding?: string) => string
+    statSync?: (file: string) => { size?: number | bigint; mtimeMs?: number | bigint }
+  } = {}
+): string {
+  try {
+    const fromApp = String(options.getVersion ? options.getVersion() || '' : '').trim()
+
+    if (!isPlaceholderAppVersion(fromApp)) {
+      return fromApp
+    }
+  } catch {
+    void 0
+  }
+
+  const execDir = path.dirname(String(options.execPath || process.execPath))
+
+  try {
+    const readFileSync = options.readFileSync ?? fs.readFileSync
+    const stamped = String(readFileSync(path.join(execDir, 'version'), 'utf8')).trim()
+
+    if (!isPlaceholderAppVersion(stamped)) {
+      return stamped
+    }
+  } catch {
+    void 0
+  }
+
+  try {
+    const statSync = options.statSync ?? fs.statSync
+    const stat = statSync(path.join(execDir, 'resources', 'app.asar'))
+
+    return `bundle-${Math.round(Number(stat.size ?? 0))}-${Math.round(Number(stat.mtimeMs ?? 0))}`
+  } catch {
+    void 0
+  }
+
+  return 'unknown'
+}
+
 export interface NvidiaEglFallbackDecision {
   enable: boolean
   reason: string | null
@@ -240,9 +309,17 @@ export function decideNvidiaEglFallback(options: {
   }
 
   // Witnessed brokenness: sticky only for the same app AND driver version.
+  // A placeholder app version cannot identify a build, so it never holds the
+  // fallback sticky — otherwise one witnessed death pins the install to
+  // software rendering forever (see resolveInformativeAppVersion).
+  const sameBuild =
+    !isPlaceholderAppVersion(appVersion) &&
+    !isPlaceholderAppVersion(marker?.version) &&
+    marker?.version === appVersion
+
   if (
     marker?.state === 'fallback' &&
-    marker.version === (appVersion || marker.version) &&
+    sameBuild &&
     marker.driverVersion === (driverVersion ?? marker.driverVersion)
   ) {
     return {

@@ -249,30 +249,12 @@ def _setup_mcp_shim(agent, args: dict, ctx: InlineToolContext) -> Any:
     }, ctx)
 
 
-
-def _todo_list(agent, args: dict, ctx: InlineToolContext) -> Any:
-    """Builtin todo write, then mirror the list into the durable work journal.
-
-    Local patch: ``tools/todo_tool.py`` stays untouched — the mirror is a
-    fail-open post-write side channel (``agent/todo_journal_bridge.py``) so a
-    session's plan survives the session.
-    """
-    result = _call_tool(
-        "tools.todo_tool", "todo_tool", args,
-        (("todos", "todos"), ("merge", "merge", False)),
-        store=agent._todo_store,
-    )
-    try:
-        from agent.todo_journal_bridge import mirror_builtin_todos
-        mirror_builtin_todos(agent)
-    except Exception:  # fail-open: never affect the tool result
-        pass
-    return result
-
-
 # Order is the historical if/elif order of ``execute_tool_calls_sequential``.
 _RAW_INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
-    "todo_list": _todo_list,  # P16: mirror the list into the work journal (fail-open)
+    "todo_list": _tool(
+        "tools.todo_tool", "todo_tool", ("todos", "todos"), ("merge", "merge", False),
+        store=lambda agent, ctx: agent._todo_store,
+    ),
     # Bot Mode teammate DM is injected, not registered: only a canonical Bot
     # Chat session carries the schema, and the tool re-gates on the title.
     "message_agent": _tool(

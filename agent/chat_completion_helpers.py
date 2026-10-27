@@ -1921,6 +1921,19 @@ def _fallback_chain_exhausted(agent, reason: FailoverReason | None) -> bool:
     if agent._fallback_chain and reason not in _RATE_LIMIT_FAILOVER_REASONS:
         agent._rate_limited_until = max(
             getattr(agent, "_rate_limited_until", 0) or 0, time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S)
+    # 712843: 候选全被拒时把「为什么」说出来 —— 日志 + 用户可见诊断态各一份。缺了这一句，
+    # 「有 3 个备份但一个都没用上」在外部看来与「上游挂了」完全一样。
+    rejected = list(getattr(agent, "_fallback_rejections", None) or [])
+    if rejected:
+        logger.warning(
+            "%sFallback chain exhausted — %d candidate(s) rejected: %s",
+            getattr(agent, "log_prefix", ""), len(rejected), "; ".join(rejected[:4]))
+        try:
+            agent._buffer_diagnostic_status(
+                "⚠️ 备份 provider 全部不可用（" + "; ".join(rejected[:3])
+                + "）—— 主 provider 的失败因此无人接手")
+        except Exception:  # 诊断面失败不得影响主流程
+            pass
     return False
 
 
@@ -2060,6 +2073,11 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
     cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
+    # 712843: 逐候选收集「为什么没用上」。没有这份账时，候选被 skip/bind 拒绝后只剩一行
+    # WARNING（或干脆无痕迹），终态还会把责任归给主 provider —— 2026-10-15 四个 cron 全灭
+    # 时就是靠人工翻日志才定位到 "Fallback to openai failed: provider not configured"。
+    rejected: list[str] = []
+    agent._fallback_rejections = rejected
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
             return _fallback_chain_exhausted(agent, reason)
@@ -2072,6 +2090,7 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
         fb_provider = (fb.get("provider") or "").strip().lower()
         fb_model = (fb.get("model") or "").strip()
         if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
+            rejected.append(f"{fb_provider}/{fb_model}: skipped (pool exhausted / same backend / unavailable)")
             continue
 
         try:
@@ -2079,6 +2098,7 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
             bound = bind_route_entry(agent, fb, fb_provider, fb_model)
             if bound is None:
                 logger.warning("Fallback to %s failed: provider not configured", fb_provider)
+                rejected.append(f"{fb_provider}/{fb_model}: provider not configured")
                 unavailable.add(fb_key)
                 continue
             old_model, old_provider = bound
@@ -2105,11 +2125,13 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
             from agent.native_compaction import resolve_native_compaction_capabilities
             agent.runtime_capabilities = resolve_native_compaction_capabilities(
                 model=agent.model, base_url=agent.base_url, provider=fb_provider, is_codex_backend=fb_provider == "openai-codex")
+            agent._fallback_rejections = []   # 712843: 成功接上后清账，免下次误读旧拒因
             return True
         except Exception as e:
             if fb_provider == "nous":
                 unavailable.add(fb_key)
             logger.error("Failed to activate fallback %s: %s", fb_model, e)
+            rejected.append(f"{fb_provider}/{fb_model}: activate failed ({type(e).__name__}: {e})")
             continue  # try next in chain
 
 

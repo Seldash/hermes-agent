@@ -1426,20 +1426,6 @@ def _apply_agent_section(agent, _agent_cfg):
             from tools.env_probe import warm_environment_probe_async
             warm_environment_probe_async()
 
-    # Cross-session work-journal brief injection (volatile system-prompt tier).
-    # When enabled, a brand-new session's prompt carries the active
-    # pending/in_progress todos from <HERMES_HOME>/data/.work_journal.json
-    # (the Feishu/CLI shared TODO).  Volatile tier = per-session rebuild,
-    # byte-stable after — safe for prompt caching.  Fail-open on read errors.
-    agent._work_journal_inject = bool(_agent_section.get("work_journal_inject", True))
-    agent._work_journal_max_items = int(_agent_section.get("work_journal_max_items", 8))
-
-    # Mirror the builtin in-memory todo tool into the durable work journal
-    # (builtin_todos section) after every write, so a session's plan survives
-    # the session.  Core-waist safe: tools/todo_tool.py is untouched; the
-    # mirror is a fail-open post-write side channel.  See agent/todo_journal_bridge.py.
-    agent._todo_mirror_to_journal = bool(_agent_section.get("todo_mirror_to_journal", True))
-
     # "Bot Chat" gate hint for hosts that defer the DB title write past the first prompt build.
     agent._session_title_hint = None
 

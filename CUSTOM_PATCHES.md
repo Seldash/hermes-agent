@@ -1082,3 +1082,13 @@
 - **验证**: `venv/bin/python -m pip check` 无输出（rc=0）；Pillow 13 依赖面实测 ImageDraw+TTF 中文、PNG/JPEG 存读、matplotlib savefig、weasyprint 出 PDF、python-pptx add_picture、pdf2image/pytesseract import 全通；filelock 4.2.4 跨进程互斥实测（两进程抢同一锁，事件序 IN/OUT/IN/OUT）。
 - **重放验证**: `verify_patches.sh` 的 `P27注入点`（4 条 pin 同时在位）。
 - **退役条件**: 上游把 4 个 pin 抬到 ≥ 本仓运行时版本后 drop（验收: `git diff <tag> -- pyproject.toml` 对本条为空）；`pr_candidate=True`，受 C3 闸门冻结先本地 carry。
+
+### P28. fallback 链耗尽时逐候选拒因无痕迹（诊断态缺失）— 2026-10-28 建立（待办 712843）
+
+- **文件**: `agent/chat_completion_helpers.py`（+22 行：`try_activate_fallback` 逐候选记拒因 → `_fallback_chain_exhausted` 汇总 WARNING + `_buffer_diagnostic_status`）。
+- **现象（取证，2026-10-15）**: 08:10-09:31 四个未 pin 的 cron 在「HTTP200 + 0 chunk + 600s 卡流 ×3」后以 `RuntimeError: Provider has been unresponsive` 终止，agent.log **全程零 fallback 痕迹**；同日上午 09:11 交互会话遇 503 时 fallback 正常切走（有 `Fallback activated`）。只读复核（10-25）定位断点在「激活」而非链解析：`_job_fallback_chain()` 对这四个 job 返回 3 条备选，但候选被 `_should_skip_fallback_candidate` 或 `bind_route_entry` 拒绝时只剩一行 WARNING（`Fallback to openai failed: provider not configured`）或完全静默，链耗尽后终态还把责任归给主 provider。定位这批全灭靠人工翻日志。
+- **本次改动**: ① `try_activate_fallback` 内新增 `rejected` 账本，三条 `continue` 路径（skip 判据 / `bound is None` / `bind` 抛异常）各记一条拒因；成功接上后清账，免下次误读旧拒因。② `_fallback_chain_exhausted` 在链耗尽时打 WARNING（带前 4 条拒因）并 `_buffer_diagnostic_status` 一条用户可见诊断态（`⚠️ 备份 provider 全部不可用（…）—— 主 provider 的失败因此无人接手`），诊断面异常被 `try/except` 兜住、不影响主流程。
+- **不变量**: 不改候选遍历顺序、不改 `_fallback_index` 推进时机（`+= 1` 位于校验/绑定之前是另一条行为缺陷，另做）、不改 `_should_skip_fallback_candidate` 判据与 cooldown 语义。
+- **已验（2026-10-25 排查期记录，未在本条登记时复跑）**: `py_compile` 通过；`tests/agent/test_stream_stale_circuit_breaker.py` + `tests/cron/test_cron_pinned_job_fallback.py` + `tests/agent/test_malformed_tool_args_no_fallback.py` 术前/术后同为 `21 failed / 8 passed`（失败全是 `tests/home_io_guard.py` 要求隔离 HERMES_HOME 的环境性问题，已用 `git checkout` 对照实验确证），补丁对既有用例零增删。
+- **重放验证**: `verify_patches.sh` 的 `P28注入点1/2`。
+- **退役条件**: 上游 `chat_completion_helpers.py` 自带同等拒因账本 + 诊断态（验收: `git diff <tag> -- agent/chat_completion_helpers.py` 对本条为空）；`pr_candidate=True`，但 C3 闸门 `review_required`（在途 PR 9 / 阈值 4）⇒ `PR_INTENT="blocked"`，不开 PR。

@@ -3291,7 +3291,8 @@ def _deliver_crash_failure(
     """Failure notice for a run that raised out of run_job. Returns (delivery_error, outcome)."""
     normalized_deliver = _normalize_deliver_value(_delivery_lane_value(job, for_failure=True))
     # Same ack gate as the normal failure delivery: acked signatures stay silent here too.
-    if _is_business_alert(err_text):
+    business_alert = _is_business_alert(err_text)
+    if business_alert:
         # Defensive: this path carries exception text, but the rc=2 contract (待办 853482: a
         # business alert is not a failure) must hold on EVERY write site — no ledger row here
         # either. Delivery below still runs: an alert is never swallowed.
@@ -3302,11 +3303,23 @@ def _deliver_crash_failure(
         return None, "suppressed_acked"
     delivery_error = None
     try:
+        if business_alert:
+            # 2026-11-03 (P19 修订)：rc=2 是「业务发现」，不是失败。崩溃路径此前照抄失败
+            # 文案（"failed:" + failure_streak nudge），既把发现谎报成故障，又让
+            # 「连续失败」曲线被业务告警污染（_failure_streak_nudge 只该数真失败）。
+            # 现在改走业务告警文案，且**不拼** nudge。
+            content = _compose_business_alert_delivery(job, err_text)
+            if not content:
+                # 冷却窗内同签名告警已投递过：重复抑制，不投空消息（也不建台账）。
+                return None, "suppressed"
+        else:
+            content = (
+                _summarize_cron_failure_for_delivery(job, err_text)
+                + _failure_streak_nudge(job)
+            )
         delivery_error = _deliver_result(
             job,
-            # Same text as the normal failure delivery: this run also counts toward
-            # failure_streak, so the nudge must leave through here too.
-            _summarize_cron_failure_for_delivery(job, err_text) + _failure_streak_nudge(job),
+            content,
             adapters=adapters,
             loop=loop,
             for_failure=True,

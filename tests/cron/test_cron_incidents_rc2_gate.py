@@ -23,10 +23,10 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-import cron.alert_cooldown as alert_cooldown  # noqa: E402
-import cron.incidents as incidents  # noqa: E402
-import cron.jobs as cron_jobs  # noqa: E402
-import cron.scheduler as sched  # noqa: E402
+from cron import alert_cooldown
+from cron import incidents
+import cron.jobs as cron_jobs
+import cron.scheduler as sched
 
 RC2_HEADER = "Script exited with code 2"
 
@@ -149,16 +149,24 @@ class TestRc2WriteGate(_IsolatedStore):
 
         self.assertEqual(upserts, [], "rc=2 崩溃路径也不得写台账")
         self.assertEqual(len(deliveries), 1, "告警必须仍离开进程")
+        # 2026-11-03 (P19 修订)：崩溃路径此前投的是失败文案（本夹具里是 "FAILED"），
+        # 等于把业务发现谎报成崩溃。断言改走业务告警文案，且不含失败/连续失败信号。
+        text = deliveries[0]
+        self.assertIn("business alert", text.lower(), "rc=2 崩溃路径必须投业务告警文案")
+        self.assertNotIn("FAILED", text, "rc=2 不得复用失败文案")
+        self.assertNotIn("failed:", text.lower(), "失败头行不得出现在业务告警里")
+        self.assertNotIn("runs in a row", text, "业务告警不得携带 failure_streak nudge")
         self.assertIsNone(delivery_error)
         self.assertEqual(outcome, "suppressed")
 
     def test_rc1_crash_path_still_writes_ledger(self):
         """反向对照：真失败在崩溃路径逐字节保持原行为（仍写台账、仍投递）。"""
-        upserts = []
+        upserts, deliveries = [], []
 
         with mock.patch.object(sched, "_upsert_incident_for_failure",
                                lambda job, err, **kw: upserts.append(err) or (False, "inc")), \
-                mock.patch.object(sched, "_deliver_result", lambda job, text, **kw: None), \
+                mock.patch.object(sched, "_deliver_result",
+                                  lambda job, text, **kw: deliveries.append(text)), \
                 mock.patch.object(sched, "_delivery_lane_value",
                                   lambda job, for_failure=False: "origin"), \
                 mock.patch.object(sched, "_resolve_delivery_targets",
@@ -169,6 +177,9 @@ class TestRc2WriteGate(_IsolatedStore):
                 self._job(), "Script exited with code 1\nstderr:\nboom", adapters=None, loop=None)
 
         self.assertEqual(len(upserts), 1, "rc=1 崩溃必须仍写台账")
+        # 反向对照：真失败路径的文案必须仍带失败信号（否则上一处断言会被「什么都不投」骗过）。
+        self.assertEqual(len(deliveries), 1)
+        self.assertIn("FAILED", deliveries[0], "rc=1 必须仍投失败文案")
 
 
 class TestMisfireSamplesStillRecorded(_IsolatedStore):

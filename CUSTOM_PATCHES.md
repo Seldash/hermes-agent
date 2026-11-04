@@ -626,6 +626,28 @@
   上游若自行引入条数计量，删本项并复核字段名（`monthly_results`）一致。看门狗
   `scripts/bocha_balance_watch.py` 依赖该字段名求和。
 
+#### P14 修订（2026-11-03）：配额落盘原子化 + 坏文件留证 + 全局口径写法统一
+
+- **来源**: 异构审计 F-20261103-004（tp）/ F-20261103-005（half）。
+- **改动**: `plugins/web/bocha/provider.py`
+  ① `_save_quota`：`open(QUOTA_FILE,"w")+json.dump` → 同目录 `tempfile.mkstemp` + `flush` + `os.fsync`
+  + `os.replace`，异常路径 `unlink` tmp（等价写不进就保持旧文件完整）；
+  ② `_load_quota`：`except (FileNotFoundError, JSONDecodeError)` 拆两支；坏文件走
+  `logger.warning(... is not valid JSON ...)` + 改名 `QUOTA_FILE.corrupt-<YYYYmmddTHHMMSS>` 留证，
+  再返回 fresh（**不再静默清零**）；
+  ③ 路径写法：`os.path.expanduser("~/.hermes/...")` / `Path.home()/".hermes"` →
+  `hermes_constants.get_process_hermes_home()`（**进程级全局**：多 profile 单进程共用一个 Bocha 账号，
+  若跟随 `get_hermes_home()` 的 routed-profile 作用域，每个 profile 会各自拿到全量余量 = 放大总量）。
+- **语义不变项（F-005 判决为「半真」）**: 配额仍是全局单文件、仍是「只告警不阻断」；`results/monthly_results`
+  字段名与跨月语义不动（看门狗 `bocha_balance_watch.py` 依赖）。
+- **已验红→绿**: 新增 `tests/local/test_bocha_quota_atomic.py`（5 例）。旧码 **3 failed**
+  （`test_save_is_atomic_when_dump_fails_midway` / `test_corrupt_file_keeps_evidence_and_warns` /
+  `test_quota_path_is_process_global_not_profile_scoped`），新码 **5 passed**；`test_local_web_providers.py` 4 passed 无回归。
+- **重放验证**: `verify_patches.sh` 新增 `P14注入点3`（`os.replace(tmp_path, QUOTA_FILE)` + `fsync`）/
+  `P14注入点4`（`.corrupt-` + `is not valid JSON`）。
+- **回滚**: `cp -a ~/.hermes/backups/mp-governance-step2-20261103/hermes-agent/plugins/web/bocha/provider.py
+  ~/.hermes/hermes-agent/plugins/web/bocha/provider.py`（或反向补丁：恢复 `open(w)+json.dump` 与合并 except 分支）。
+
 ### P15. cron 落库侧 rc 分流（rc 2 业务告警不再写成 error / 不再累加 failure_streak）— 2026-09-18 建立
 
 - **文件**: `cron/jobs.py`（`ALERT_EXIT_CODE` / `script_exit_code` / `_derived_last_status` /
@@ -888,6 +910,25 @@
 - **回滚**: `git checkout -- cron/scheduler.py tests/cron/test_cron_incidents_rc2_gate.py`；
   `verify_patches.sh` 从 `verify_patches.sh.bak-20261014-p19inj45` 还原后重打 L1 基线。无数据迁移:
   已 resolved 的历史行留档，不追改。
+
+#### P19 修订（2026-11-03）：崩溃路径的 rc=2 文案改业务告警，且不拼 failure_streak nudge
+
+- **来源**: 异构审计 F-20261103-006（tp）。
+- **改动**: `cron/scheduler.py::_deliver_crash_failure` —— 上一轮（2026-10-12 追加）只把该路径的**台账写入**关掉，
+  投递文案仍照抄失败模板：`_summarize_cron_failure_for_delivery(job, err_text) + _failure_streak_nudge(job)`
+  → 用户看到「作业失败」，而 rc=2 契约明确「不是失败」；nudge 同属污染面（`failure_streak` 只该数真失败）。
+  现在 `business_alert = _is_business_alert(err_text)` 一次判定，两处复用：rc=2 走
+  `_compose_business_alert_delivery(job, err_text)`（冷却窗内返空串 → `return None, "suppressed"`，不投空消息）；
+  rc=1/7/未知仍走失败文案 + nudge（逐字不变）。
+- **已验红→绿**: `tests/cron/test_cron_incidents_rc2_gate.py` 加断言（含 `business alert`、不含 `FAILED` /
+  `failed:` / `runs in a row`），并给 rc=1 反向用例加「必须仍含 FAILED」。旧码 **1 failed**
+  （`AssertionError: 'business alert' not found in 'failed'`），新码 **14 passed + 13 subtests**。
+- **重放验证**: `verify_patches.sh` 新增 `P19注入点6`（`_compose_business_alert_delivery(job, err_text)` 在
+  crash 路径必须出现）/ `P19注入点7`（不得再出现 `_compose_business_alert_delivery(job, err_text) +`）。
+- **回滚**: `cp -a ~/.hermes/backups/mp-governance-step2-20261103/hermes-agent/cron/scheduler.py
+  ~/.hermes/hermes-agent/cron/scheduler.py`；或反向补丁：删 `business_alert` 分支与早退，恢复单行拼接投递。
+- **生效条件**: 改的是调度器本体 → 需重启 cron/scheduler 进程（本轮未重启；下一次调度器重启后生效，
+  新旧并存安全：仅影响新产生的 rc=2 崩溃投递文案）。
 
 ### P20. 进程环境注入的密钥纳入值级脱敏注册表 — 2026-10-11 建立
 

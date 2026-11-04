@@ -20,24 +20,31 @@ from __future__ import annotations
 import json
 import logging
 import os
+import tempfile
 import urllib.request
 import urllib.error
-from pathlib import Path
+from datetime import datetime
 from typing import Any, Dict
 
 from agent.web_search_provider import WebSearchProvider
+from hermes_constants import get_process_hermes_home
 
 logger = logging.getLogger(__name__)
 
 BOCHA_API_URL = "https://api.bochaai.com/v1/web-search"
-QUOTA_FILE = os.path.expanduser("~/.hermes/data/.bocha_daily.json")
+# 2026-11-03 (P14 修订): 配额是**进程级全局**口径 —— 网关多 profile 单进程共用一个
+# Bocha 账号，按 profile 分账会让每个 profile 各自拿到 60/1000 的余量，等于放大总量。
+# 故取 get_process_hermes_home()（与请求上下文里的 profile override 无关），不吃
+# get_hermes_home()（它会跟随 routed-profile 作用域）。同源真身 ~/.hermes/data/.bocha_daily.json。
+_HERMES_HOME = get_process_hermes_home()
+QUOTA_FILE = str(_HERMES_HOME / "data" / ".bocha_daily.json")
 DEFAULT_DAILY_LIMIT = 50
 DEFAULT_MONTHLY_LIMIT = 1000
 
 
 def _load_api_key() -> str | None:
     """Load BOCHA_API_KEY from .env file."""
-    env_path = Path.home() / ".hermes" / ".env"
+    env_path = _HERMES_HOME / ".env"
     if not env_path.exists():
         return None
     for line in env_path.read_text(encoding="utf-8").splitlines():
@@ -48,7 +55,7 @@ def _load_api_key() -> str | None:
 
 def _load_quota() -> dict:
     """Load daily + monthly Bocha usage from tracking file."""
-    today = __import__("datetime").date.today().isoformat()
+    today = datetime.now().date().isoformat()
     current_month = today[:7]
     try:
         with open(QUOTA_FILE, encoding="utf-8") as f:
@@ -76,7 +83,24 @@ def _load_quota() -> dict:
         data.setdefault("monthly_results", 0)
         data.setdefault("month", current_month)
         return data
-    except (FileNotFoundError, json.JSONDecodeError):
+    except FileNotFoundError:
+        return _fresh_quota(today, current_month)
+    except json.JSONDecodeError as exc:
+        # 2026-11-03 (P14 修订): 解析失败**不许静默清零**——旧实现直接 return fresh，
+        # 本地限额闸门随之从 0 重新计数，而没有任何一条日志说明「计数被丢了」。
+        # 现在：① 打 warning（含原始文件路径与解码错误）② 把坏文件改名留证
+        # （.corrupt-<YYYYmmddTHHMMSS>），下一位能拿原件复现而不是只剩一个猜测。
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        corrupt_path = f"{QUOTA_FILE}.corrupt-{stamp}"
+        logger.warning(
+            "Bocha quota file %s is not valid JSON (%s); keeping evidence at %s and "
+            "starting a fresh counter", QUOTA_FILE, exc, corrupt_path,
+        )
+        try:
+            os.replace(QUOTA_FILE, corrupt_path)
+        except OSError as rename_exc:  # 留证失败不阻断搜索，但必须留痕
+            logger.warning("Could not move corrupt quota file %s aside: %s",
+                           QUOTA_FILE, rename_exc)
         return _fresh_quota(today, current_month)
 
 
@@ -94,9 +118,28 @@ def _fresh_quota(today: str, month: str) -> dict:
 
 
 def _save_quota(data: dict) -> None:
-    os.makedirs(os.path.dirname(QUOTA_FILE), exist_ok=True)
-    with open(QUOTA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f)
+    """Write the quota file atomically (tmp in the same dir + os.replace).
+
+    2026-11-03 (P14 修订): 旧实现 `open(QUOTA_FILE,"w") + json.dump` 中途失败会留下
+    半截文件（下一次读取走 JSONDecodeError → 静默重置计数，历史口径整段丢失）。
+    同目录 tmp + fsync + `os.replace` 让「旧完整文件」或「新完整文件」二者必居其一；
+    任何异常路径都清掉 tmp，不留 `.tmp` 垃圾。
+    """
+    directory = os.path.dirname(QUOTA_FILE)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".bocha_daily.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, QUOTA_FILE)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 class BochaWebSearchProvider(WebSearchProvider):
@@ -119,7 +162,7 @@ class BochaWebSearchProvider(WebSearchProvider):
     def supports_extract(self) -> bool:
         return False
 
-    def search(self, query: str, limit: int = 5) -> Dict[str, Any]:
+    def search(self, query: str, limit: int = 5) -> dict[str, Any]:
         """Execute a search against the Bocha AI Web Search API.
 
         Returns the standard ``{"success": ..., "data": {"web": [...]}}`` shape
@@ -228,7 +271,7 @@ class BochaWebSearchProvider(WebSearchProvider):
 
         return {"success": True, "data": {"web": web_results}}
 
-    def get_setup_schema(self) -> Dict[str, Any]:
+    def get_setup_schema(self) -> dict[str, Any]:
         return {
             "name": "Bocha / 博查",
             "badge": "free · 1000/month · ¥0.06/query",
@@ -275,6 +318,7 @@ def _auto_pause(quota: dict) -> None:
             capture_output=True,
             stdin=subprocess.DEVNULL,
             timeout=10,
+            check=False,
         )
     except Exception:
         pass

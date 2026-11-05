@@ -1124,6 +1124,17 @@
 - **重放验证**: `verify_patches.sh` 的 `P27注入点`（4 条 pin 同时在位）。
 - **退役条件**: 上游把 4 个 pin 抬到 ≥ 本仓运行时版本后 drop（验收: `git diff <tag> -- pyproject.toml` 对本条为空）；`pr_candidate=True`，受 C3 闸门冻结先本地 carry。
 
+### P29. allowlist 迁移后批准表为空 → owner 被当陌生（加载期 bootstrap 缺失）— 2026-11-05 建立（待办 104129）
+
+- **文件**: `gateway/pairing.py`（+95 行：`_allowlist_snapshot()` + `PairingStore.bootstrap_from_allowlist()` + `__init__(bootstrap_allowlist=)`）、`gateway/run.py`（主 store 传 `bootstrap_allowlist=True`）、`gateway/run_adapters.py`（次 profile store 同）、`tests/gateway/test_pairing_allowlist_bootstrap.py`（新增 5 例）。
+- **现象（取证，2026-10-29 trantor）**: `FEISHU_ALLOWED_USERS` 从 profile `.env` 迁到 vault/config 后，trantor 的 pairing 批准表为空（`Approved Users = 0`），owner 私聊 bot 被判陌生并收到配对码。身份判定：`.env.bak.1793071117` 第 17 行的 `ou_163798…` 与 pending 条目逐字一致（open_id 按 app 作用域，跨 app 不可比），确认是同一 owner 而非陌生人；应急处置为手工批准。
+- **根因**: 鉴权是 `approved ∪ allowlist` 并集（`gateway/authz_mixin.py` `_is_user_authorized`），但迁移当次白名单没进该 profile 的 secret scope（multiplex 下 scoped miss 返回空串、不回落主 env，`gateway/platforms/_shared.py` #72348），批准表又是空的 ⇒ 两条同时空缺，整条准入链静默把 owner 挡在门外，且**下次任何 allowlist 迁移必然复发**。
+- **本次改动**: ① 加载期 bootstrap：`approved` 文件为空且该平台 allowlist 已配置（且不含 `*`）时，把 allowlist 的 id 以 `migrated_from_env` 标记写入批准表并打 `WARNING`（含 seeded/pruned 计数）。② 同一遍做「反向剪枝」：`migrated_from_env` 条目若已不在当前 allowlist 里就删除——否则这份副本会让运营者改 `FEISHU_ALLOWED_USERS` 的撤权动作变 no-op（union 下副本仍放行）。③ 仅网关加载期触发（主 store + 每个 served profile store）；CLI / web 读接口保持只读。④ profile-scoped store 从**自己 profile home 的 secret scope** 取 allowlist（boot 期次 profile store 建在其 runtime scope 之外，走环境 scope 会读到 default 的名单 = 跨 profile 镜像面）。
+- **不变量**: 未配置 allowlist（开放网关）时一律不写不剪；`*` 通配符不落表；手工批准（无 `migrated_from_env` 标记）永不被剪；`is_approved`/`revoke`/`approve_code` 语义与文件格式不变（新增字段只是附加键）。
+- **已验（2026-11-05 本机）**: `pytest tests/gateway/test_pairing_allowlist_bootstrap.py` 5 passed（空库播种+WARNING / 非白名单仍拒绝 / 未配 allowlist 不写 / 移除后剪枝 / 手工批准不被误剪）；既有 `tests/gateway/test_pairing.py` 34 passed；生产漂移演练（空 HOME + 真实 trantor secret scope）`DRILL = PASS`；14:40:55 合规重启后两 store 均未触发播种（现存 owner 条目已在，符合预期），trantor DM 在批准表被临时移走的条件下仍被放行并回复（活证）。
+- **重放验证**: `verify_patches.sh` 的 `P29注入点1..4`。
+- **退役条件**: 上游 `gateway/pairing.py` 自带加载期 allowlist bootstrap（验收: `git diff <tag> -- gateway/pairing.py gateway/run.py gateway/run_adapters.py` 对本条为空）；`pr_candidate=True`，但 C3 闸门在途 PR 6/6 + 本周净增提示 ⇒ `PR_INTENT="blocked"`，不开 PR。
+
 ### P28. fallback 链耗尽时逐候选拒因无痕迹（诊断态缺失）— 2026-10-28 建立（待办 712843）
 
 - **文件**: `agent/chat_completion_helpers.py`（+22 行：`try_activate_fallback` 逐候选记拒因 → `_fallback_chain_exhausted` 汇总 WARNING + `_buffer_diagnostic_status`）。

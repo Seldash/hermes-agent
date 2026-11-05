@@ -1051,7 +1051,7 @@ class GatewayAdapterLifecycleMixin:
             for name in served:
                 if name and name not in self.pairing_stores:
                     self.pairing_stores[name] = (
-                        self.pairing_store if name == active else PairingStore(profile=name)
+                        self.pairing_store if name == active else PairingStore(profile=name, bootstrap_allowlist=True)
                     )
             publish_runtime_status(served_profiles=served)
             # The host record is what a second `gateway run` reads to decide attach-vs-start; keep

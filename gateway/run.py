@@ -3684,7 +3684,9 @@ class GatewayRunner(
         # per-profile map ``authz_mixin._is_user_authorized`` routes through (one whitelist per profile).
         from gateway.pairing import PairingStore
         from gateway.hooks import ProfileHookRegistries
-        self.pairing_store = PairingStore()
+        # bootstrap_allowlist: a configured allowlist with an empty approved store means
+        # every allowlist migration silently locked its owner out (2026-10-29 trantor).
+        self.pairing_store = PairingStore(bootstrap_allowlist=True)
         self.pairing_stores: dict[str, PairingStore] = {}
         # One HookRegistry per served profile home, resolved from the active scope at emit time.
         self.hooks = ProfileHookRegistries()

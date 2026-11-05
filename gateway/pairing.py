@@ -153,6 +153,31 @@ def _configured_allowlist(platform: str):
     return (env_var, _split_allowlist(current)) if current else None
 
 
+def _allowlist_snapshot(profile_home: Optional[Path] = None) -> dict:
+    """``platform -> raw allowlist string`` for the store's own profile scope.
+
+    ``profile_home=None`` reads through the ambient scoped reader, which is the
+    same reader authorization uses (so the bootstrap can never disagree with the
+    gate). A profile-scoped store reads its home's own secret scope instead: at
+    gateway boot the secondary stores are built OUTSIDE that profile's runtime
+    scope, so the ambient reader would answer for the default profile and mirror
+    the wrong list into the wrong directory (the #72348 leak class).
+    """
+    if profile_home is None:
+        return {p: _read_allowlist_env(env) for p, env in _PLATFORM_ALLOWLIST_ENV.items() if env}
+    try:
+        from agent.secret_scope import build_profile_secret_scope
+        scope = build_profile_secret_scope(Path(profile_home))
+    except Exception:  # fail closed: no snapshot, no writes
+        logger.warning(
+            "Could not build the secret scope for %s; skipping pairing allowlist bootstrap",
+            profile_home, exc_info=True,
+        )
+        return {}
+    return {p: str(scope.get(env) or "").strip() for p, env in _PLATFORM_ALLOWLIST_ENV.items() if env}
+
+
+
 def _write_allowlist_env(env_var: str, ids: list) -> None:
     """Best-effort persist (empty list removes the key); the pairing store grant still authorizes via the union."""
     with contextlib.suppress(Exception):
@@ -331,11 +356,12 @@ class PairingStore:
     gateways and profile-scoped CLI approvals share one whitelist.
     """
 
-    def __init__(self, profile: Optional[str] = None):
+    def __init__(self, profile: Optional[str] = None, *, bootstrap_allowlist: bool = False):
         profile_home = None
         if profile:
             root = get_default_hermes_root()
             profile_home = root if profile == "default" else root / "profiles" / profile
+        self._profile_home = profile_home
         self._dir = get_hermes_dir("platforms/pairing", "pairing", home=profile_home) if profile else _default_pairing_dir()
         self._dir.mkdir(parents=True, exist_ok=True)
         # Merge the alternate old/new layout so upgrades cannot split approvals.
@@ -343,6 +369,14 @@ class PairingStore:
         self._lock = threading.RLock()  # adapters run concurrently in threads sharing one store
         self._profile = profile  # for diagnostics / log lines
         self._approved_cache: dict = {}
+        # Load-time only (gateway boot). CLI/web readers stay read-only: a list
+        # command must never mint approvals behind the operator's back.
+        if bootstrap_allowlist:
+            try:
+                self.bootstrap_from_allowlist()
+            except Exception:  # never block gateway startup on this
+                logger.warning("Pairing allowlist bootstrap failed; approvals left untouched", exc_info=True)
+
 
     @property
     def profile(self) -> Optional[str]:
@@ -413,6 +447,72 @@ class PairingStore:
             for p in self._platforms(platform, "approved")
             for uid, info in self._load_json(self._approved_path(p)).items()
         ]
+
+    def bootstrap_from_allowlist(self) -> dict:
+        """Seed pairing approvals from the configured allowlists (load-time migration).
+
+        Why: an allowlist that lives in the environment/config is authoritative for
+        authorization (gate admits ``approved ∪ allowlist``), but the pairing store is
+        the only visible record of "who is already known". Every allowlist migration
+        (env -> vault/config) that landed while the store was empty therefore left the
+        owner looking like a stranger and locked them out until someone dug the old
+        ``.env.bak`` by hand (2026-10-29 trantor incident).
+
+        Seeds only when the approved file is EMPTY, and marks every seeded entry
+        ``migrated_from_env``. Those entries are pruned on the next boot as soon as
+        their id disappears from the configured allowlist -- otherwise the copy would
+        silently outlive an operator removing someone from ``FEISHU_ALLOWED_USERS``
+        and turn a de-authorization into a no-op.
+
+        Never seeds a wildcard (``*``): a wildcard allowlist already admits everyone,
+        so materializing it would write one entry per user and prune incorrectly.
+        Returns ``{"seeded": {platform: n}, "pruned": {platform: n}}``.
+        """
+        snapshot = _allowlist_snapshot(self._profile_home)
+        seeded: dict = {}
+        pruned: dict = {}
+        for platform, raw in snapshot.items():
+            ids = _split_allowlist(raw)
+            if not ids or "*" in ids:
+                continue
+            path = self._approved_path(platform)
+            approved = self._load_json(path)
+            changed = False
+            if not approved:
+                for uid in ids:
+                    normalized = _normalize_user_id(platform, uid)
+                    approved[normalized] = {
+                        "user_name": "",
+                        "approved_at": time.time(),
+                        "migrated_from_env": True,
+                        "source_env": _PLATFORM_ALLOWLIST_ENV.get(platform, ""),
+                    }
+                seeded[platform] = len(ids)
+                changed = True
+            else:
+                stale = [
+                    uid for uid, info in approved.items()
+                    if isinstance(info, dict) and info.get("migrated_from_env")
+                    and not any(_user_ids_match(platform, uid, allowed) for allowed in ids)
+                ]
+                for uid in stale:
+                    approved.pop(uid, None)
+                if stale:
+                    pruned[platform] = len(stale)
+                    changed = True
+            if changed:
+                with self._lock:
+                    self._save_json(path, approved)
+                    self._approved_cache.pop(platform, None)
+        if seeded or pruned:
+            logger.warning(
+                "Pairing allowlist bootstrap (profile=%s): seeded %s from configured allowlists "
+                "because the approved list was empty; pruned %s no longer allowlisted. "
+                "Seeded entries are marked migrated_from_env and are dropped again once removed "
+                "from the allowlist.",
+                self._profile or "default", seeded or "{}", pruned or "{}",
+            )
+        return {"seeded": seeded, "pruned": pruned}
 
     def _approve_user(self, platform: str, user_id: str, user_name: str = "") -> None:
         """Add a user to the approved list. Must be called under self._lock."""

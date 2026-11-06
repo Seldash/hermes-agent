@@ -1152,7 +1152,19 @@
 - **文件**: `agent/chat_completion_helpers.py`（+22 行：`try_activate_fallback` 逐候选记拒因 → `_fallback_chain_exhausted` 汇总 WARNING + `_buffer_diagnostic_status`）。
 - **现象（取证，2026-10-15）**: 08:10-09:31 四个未 pin 的 cron 在「HTTP200 + 0 chunk + 600s 卡流 ×3」后以 `RuntimeError: Provider has been unresponsive` 终止，agent.log **全程零 fallback 痕迹**；同日上午 09:11 交互会话遇 503 时 fallback 正常切走（有 `Fallback activated`）。只读复核（10-25）定位断点在「激活」而非链解析：`_job_fallback_chain()` 对这四个 job 返回 3 条备选，但候选被 `_should_skip_fallback_candidate` 或 `bind_route_entry` 拒绝时只剩一行 WARNING（`Fallback to openai failed: provider not configured`）或完全静默，链耗尽后终态还把责任归给主 provider。定位这批全灭靠人工翻日志。
 - **本次改动**: ① `try_activate_fallback` 内新增 `rejected` 账本，三条 `continue` 路径（skip 判据 / `bound is None` / `bind` 抛异常）各记一条拒因；成功接上后清账，免下次误读旧拒因。② `_fallback_chain_exhausted` 在链耗尽时打 WARNING（带前 4 条拒因）并 `_buffer_diagnostic_status` 一条用户可见诊断态（`⚠️ 备份 provider 全部不可用（…）—— 主 provider 的失败因此无人接手`），诊断面异常被 `try/except` 兜住、不影响主流程。
-- **不变量**: 不改候选遍历顺序、不改 `_fallback_index` 推进时机（`+= 1` 位于校验/绑定之前是另一条行为缺陷，另做）、不改 `_should_skip_fallback_candidate` 判据与 cooldown 语义。
+- **不变量**: 不改候选遍历顺序、不改 `_fallback_index` 推进时机（`+= 1` 位于校验/绑定之前是另一条行为缺陷，另做 → 已由 **P31** 落地）、不改 `_should_skip_fallback_candidate` 判据与 cooldown 语义。
 - **已验（2026-10-25 排查期记录，未在本条登记时复跑）**: `py_compile` 通过；`tests/agent/test_stream_stale_circuit_breaker.py` + `tests/cron/test_cron_pinned_job_fallback.py` + `tests/agent/test_malformed_tool_args_no_fallback.py` 术前/术后同为 `21 failed / 8 passed`（失败全是 `tests/home_io_guard.py` 要求隔离 HERMES_HOME 的环境性问题，已用 `git checkout` 对照实验确证），补丁对既有用例零增删。
 - **重放验证**: `verify_patches.sh` 的 `P28注入点1/2`。
 - **退役条件**: 上游 `chat_completion_helpers.py` 自带同等拒因账本 + 诊断态（验收: `git diff <tag> -- agent/chat_completion_helpers.py` 对本条为空）；`pr_candidate=True`，但 C3 闸门 `review_required`（在途 PR 9 / 阈值 4）⇒ `PR_INTENT="blocked"`，不开 PR。
+
+### P31. fallback 游标在绑定之前推进 → 被拒候选永久占槽、链假性耗尽 — 2026-11-06 建立（待办 712843）
+
+- **文件**: `agent/chat_completion_helpers.py`（`try_activate_fallback`：游标改局部 `index` 按调用推进，`agent._fallback_index` 只在候选绑定成功时写回；全链被拒时游标保持原位）；测试: `tests/agent/test_fallback_index_commit_after_bind.py`（新增 4 例）。
+- **现象（取证，2026-10-15）**: 四个未 pin 的 cron 在「HTTP200 + 0 chunk + 600s 卡流 ×3」后以 `RuntimeError: Provider has been unresponsive` 终止；`_job_fallback_chain()` 对这四个 job 实跑返回 3 条备选，agent.log 里 fallback 尝试为零。同日上午 09:11 交互会话遇 503 时 fallback 正常（有 `Fallback activated`）⇒ 断点在「激活」，不在链解析。
+- **根因**: 旧循环在每个候选上先 `fb = chain[_fallback_index]` 再 `_fallback_index += 1`，然后才做 skip 判据与 `bind_route_entry`；三条 `continue` 路径（skip / `bound is None` / bind 抛异常）都不回滚游标 ⇒ 被拒候选把自己的槽位永久占掉。候选全被拒后 `_fallback_index` 已到 `len(chain)`，`_has_pending_fallback()` 变假，后续错误路径连「trying fallback...」都不再打，终态把责任归给主 provider。被拒原因本身常是**暂时**的（credential pool 冷却 ≤600s、entitlement 暂拒、当前 provider 变了之后「同后端」判据不再成立），本可在下一次尝试里用上。
+- **本次改动**: ① 循环条件改为 `while index < len(agent._fallback_chain)`，`index` 是本次调用的局部游标；② 只有 `bind_route_entry` 返回非 None（候选真换上身）才 `agent._fallback_index = index`；③ 走完剩余候选一个都没接上时**不写回**游标，由 `_fallback_chain_exhausted(agent, reason)` 收尾（P28 的拒因账本 + 诊断态照旧）。
+- **不变量**: 不改候选遍历顺序与 skip/cooldown 判据；不改「同一调用内每个候选只试一次」（局部游标单调推进，无死循环）；不改链耗尽时的 cooldown 语义（`_fallback_chain_exhausted` 仍是唯一出口）；不改 `_fallback_index` 的成功语义（成功时其值与旧实现相同）。
+- **已知行为差（有意）**: 链被拒后 `_has_pending_fallback()` 保持 True ⇒ 同一 turn 内后续错误路径可能再走一遍链（每候选一次 skip/bind，均为本地操作），换来的是「暂时性拒因之后仍能切」；风暴面由既有 `_FALLBACK_EXHAUSTED_COOLDOWN_S` + `restore_primary_runtime` 的 gating 守住（#24996 语义未变）。
+- **已验（2026-11-06 本机）**: 红 = 基线（`git checkout HEAD -- agent/chat_completion_helpers.py`，守卫断言补丁特征串为 0）上 `test_fallback_index_commit_after_bind.py` **3 failed / 1 passed**；绿 = 补丁后同文件 **4 passed**。邻接 13 文件：补丁后 `83 passed / 7 failed`，基线同文件集 `2 passed / 7 failed` —— 失败集合逐条相同（`test_empty_response_fallback_refund.py` 2 例 + `test_turn_recovery_autorecover.py` 5 例，全是 `tests/home_io_guard.py` 的 REAL hermes home 环境性失败，`test_malformed_tool_args_no_fallback.py` 2 例同上），零新增失败。
+- **重放验证**: `verify_patches.sh` 的 `P31注入点1..3`。
+- **退役条件**: 上游 `try_activate_fallback` 的游标在绑定成功后提交（验收: `git diff <tag> -- agent/chat_completion_helpers.py` 对本条为空）；`pr_candidate=True`，但 C3 闸门在途 PR 6/6 + 核心补丁 31/15 ⇒ `PR_INTENT="blocked"`，不开 PR。

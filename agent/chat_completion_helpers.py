@@ -2078,11 +2078,14 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
     # 时就是靠人工翻日志才定位到 "Fallback to openai failed: provider not configured"。
     rejected: list[str] = []
     agent._fallback_rejections = rejected
-    while True:
-        if agent._fallback_index >= len(agent._fallback_chain):
-            return _fallback_chain_exhausted(agent, reason)
-        fb = agent._fallback_chain[agent._fallback_index]
-        agent._fallback_index += 1
+    # 712843: 游标按调用推进，只有候选**真的接上**才写回 agent._fallback_index。旧写法在
+    # 校验/绑定之前就 += 1 —— 被拒候选（credential pool 冷却、entitlement 暂拒、bind 失败）
+    # 会永久占掉自己的槽位，链在外部看来「已耗尽」，之后再想切只剩静默：2026-10-15
+    # 四个未 pin 的 cron 就是这样在 3 个备选全被拒后连 "trying fallback" 都不再打。
+    index = getattr(agent, "_fallback_index", 0)
+    while index < len(agent._fallback_chain):
+        fb = agent._fallback_chain[index]
+        index += 1
         fb_key = _fallback_entry_key(fb)
         if getattr(agent, "_unavailable_fallback_keys", None) is None:
             agent._unavailable_fallback_keys = set()
@@ -2101,6 +2104,8 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
                 rejected.append(f"{fb_provider}/{fb_model}: provider not configured")
                 unavailable.add(fb_key)
                 continue
+            # 712843: 到这里候选已换上身，才把游标写回 agent —— 之前的所有 continue 都不消耗槽位。
+            agent._fallback_index = index
             old_model, old_provider = bound
             fb_model = agent.model  # normalized by the binder
             rewrite_prompt_model_identity(agent, fb_model, fb_provider)
@@ -2133,6 +2138,9 @@ def try_activate_fallback(agent, reason: FailoverReason | None = None, reset_at=
             logger.error("Failed to activate fallback %s: %s", fb_model, e)
             rejected.append(f"{fb_provider}/{fb_model}: activate failed ({type(e).__name__}: {e})")
             continue  # try next in chain
+    # 走完剩余候选一个都没接上：游标保持原位（不写回），下一次激活仍能把它们再试一遍
+    # （pool 冷却到期 / 当前 provider 变了之后「同后端」判据也可能不再成立）。
+    return _fallback_chain_exhausted(agent, reason)
 
 
 # Keys outside the Chat Completions schema that strict gateways (Fireworks-backed OpenCode

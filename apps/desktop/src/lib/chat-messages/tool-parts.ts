@@ -503,8 +503,17 @@ function findPendingClarifyLocation(
 
   // Older/sparse projections can lose the identifying args. One session can
   // only block on one clarify at a time, so a sole open clarify is still the
-  // authoritative row even without a usable correlation value.
-  return pendingCount === 1 ? solePending : null
+  // authoritative row — but ONLY when it has no args of its own to contradict
+  // that. A row that already names a different question must not be adopted:
+  // merging this request's args over it rewrites that question in place, and the
+  // request's own provider row then mounts a second copy of the same card.
+  if (pendingCount === 1 && solePending) {
+    const part = messages[solePending.messageIndex].parts[solePending.partIndex]
+
+    return toolPartMatchValues(part).length === 0 ? solePending : null
+  }
+
+  return null
 }
 
 function skippedClarifyResult(part: Extract<ChatMessagePart, { type: 'tool-call' }>): Record<string, unknown> {

@@ -1124,6 +1124,18 @@
 - **重放验证**: `verify_patches.sh` 的 `P27注入点`（4 条 pin 同时在位）。
 - **退役条件**: 上游把 4 个 pin 抬到 ≥ 本仓运行时版本后 drop（验收: `git diff <tag> -- pyproject.toml` 对本条为空）；`pr_candidate=True`，受 C3 闸门冻结先本地 carry。
 
+### P30. 同一会话一个选择题显示两次（待答卡按会话取值、缺行归属）— 2026-11-06 建立
+
+- **文件**: `apps/desktop/src/components/assistant-ui/clarify/index.tsx`（行归属 `rowKeyByRequestId` + `argsMatchQuestions` + 抑制计数 `suppressedClarifyRowCount` / `resetClarifyCardBindingsForTests`）、`apps/desktop/src/lib/chat-messages/tool-parts.ts`（`findPendingClarifyLocation` 的 sole-open 兜底加「目标行自身无匹配值」前置）；测试: `apps/desktop/src/components/assistant-ui/clarify/clarify-duplicate-card.test.tsx`（新增 3 例）、`apps/desktop/src/app/session/hooks/use-message-stream/clarify-hydration.test.tsx`（+1 例）。
+- **现象**: 一个拍板选择题在 transcript 里出现两次（同一题、同一组选项），偶发。
+- **取证（2026-11-06 上午，审计端优化会话）**: state.db 当日 clarify 仅 2 次（10:38:44 / 10:41:07，同一 turn，`duration=1054.3s`），后端各一次请求一次应答；同期 `tui_gateway.ws` 无 accepted/closed（非重放）；客户端 bundle 2026-10-24 构建、chat-messages 分块哈希与主机一致（非版本落后）⇒ 排除「agent 问两次 / 后端重发 / 重连重画 / 客户端落后」。
+- **根因**: `ClarifyToolPending` 只要有活请求就渲染 `request.questions`；`ClarifyToolLive` 取的是**会话级** `sessionClarifyRequest(sessionId)`（不是本行 `toolCallId` 对应的请求），`requestIdByToolCall` 只防「同一行复用旧请求」，不防「多行画同一请求」→ 每条未结案 clarify 行都画出当前题。第二条未结案行由 `restorePendingBlockingToolCall` 的 sole-open 兜底造成：请求早于本轮 assistant 行到达时，尾部行还是上一轮，新题 args 被覆盖进那条无关的未结案行，随后 provider 的 `tool.start` 另挂一行 ⇒ 同一题两张卡。
+- **本次改动**: ① 行归属——只有 args 命中活请求问题、或未带 args 的首个未结案行渲染活卡，其余降级 `ToolFallback`；② sole-open 兜底只在目标行自身没有匹配值时生效，避免覆盖不相关的旧题；③ 抑制计数（按 request 记被抑制行）+ 出现第 2 条时一次 `console.warn`，使复发可度量而非靠肉眼。
+- **已验（2026-11-06 本机，Node 22 + repo vitest）**: 红 = 基线上同一题渲染 2 处（`expected [ … ] to have a length of 1 but got 2`）、sole-open 把两条行覆盖成 1 条（`expected length 2 but got 1`）；绿 = `clarify-duplicate-card.test.tsx` 3 passed / `clarify-hydration.test.tsx` 16 passed / `src/lib` 173 files · 1756 tests passed / `use-message-stream` 57 files · 303 tests passed。
+- **重放验证**: `verify_patches.sh` 的 `P30注入点1/2`。
+- **退役条件**: 上游 `clarify/index.tsx` 自带行归属（验收: `git diff <tag> -- apps/desktop/src/components/assistant-ui/clarify/index.tsx apps/desktop/src/lib/chat-messages/tool-parts.ts` 对本条为空）；`pr_candidate=True`，但 C3 闸门在途 PR 6/6 ⇒ `PR_INTENT="blocked"`，不开 PR。
+- **待收口**: 补丁只在源码树生效，**客户端 bundle 未重建**（重建属 tier1，需窗口：笔记本上 stage-and-swap + 实测 + 回滚留 `app.asar.bak`）。
+
 ### P29. allowlist 迁移后批准表为空 → owner 被当陌生（加载期 bootstrap 缺失）— 2026-11-05 建立（待办 104129）
 
 - **文件**: `gateway/pairing.py`（+95 行：`_allowlist_snapshot()` + `PairingStore.bootstrap_from_allowlist()` + `__init__(bootstrap_allowlist=)`）、`gateway/run.py`（主 store 传 `bootstrap_allowlist=True`）、`gateway/run_adapters.py`（次 profile store 同）、`tests/gateway/test_pairing_allowlist_bootstrap.py`（新增 5 例）。

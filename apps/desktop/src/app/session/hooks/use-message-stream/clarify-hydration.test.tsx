@@ -203,6 +203,45 @@ describe('clarify request stream hydration', () => {
     expect(stream.state().streamId).toBe('assistant-pending')
   })
 
+  it('does not adopt an open row that already names a different question', () => {
+    mountStream()
+
+    // The previous call was left open (a lost tool.complete). Adopting it for the NEW request
+    // would rewrite "Drink?" into "Productive when?", so the provider row that follows mounts a
+    // second copy of the same question — the duplicate card seen in the field.
+    seedHydratedMessages([
+      { id: 'user-1', role: 'user', parts: [{ type: 'text', text: 'help me choose' }] },
+      {
+        id: 'assistant-old',
+        role: 'assistant',
+        pending: true,
+        parts: [
+          {
+            type: 'tool-call',
+            toolCallId: 'call-old',
+            toolName: 'clarify',
+            args: { questions: [{ choices: ['a', 'b'], question: 'Drink?' }] },
+            argsText: '{"questions":[{"question":"Drink?","choices":["a","b"]}]}'
+          }
+        ]
+      }
+    ])
+
+    clarifyRequest({
+      questions: [{ choices: ['x', 'y'], qid: 'q0', question: 'Productive when?' }],
+      request_id: 'req-new'
+    })
+
+    const parts = clarifyParts()
+    expect(parts).toHaveLength(2)
+    expect(parts[0].type === 'tool-call' && parts[0].args).toMatchObject({
+      questions: [{ question: 'Drink?' }]
+    })
+    expect(parts[1].type === 'tool-call' && parts[1].args).toMatchObject({
+      questions: [{ question: 'Productive when?' }]
+    })
+  })
+
   it('keeps a hydrated DeepSeek text-plus-clarify row in its original position', () => {
     mountStream()
 

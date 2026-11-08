@@ -648,6 +648,26 @@
 - **回滚**: `cp -a ~/.hermes/backups/mp-governance-step2-20261103/hermes-agent/plugins/web/bocha/provider.py
   ~/.hermes/hermes-agent/plugins/web/bocha/provider.py`（或反向补丁：恢复 `open(w)+json.dump` 与合并 except 分支）。
 
+#### P14 修订（2026-11-06）：key / 配额锚到账号级（独立 profile 进程真正可用）
+
+- **来源**: auditor profile 把搜索后端切成 bocha 时实测 —— 配置生效了，`web_search` 却返回
+  `backend=exa`（静默回落），且配额账本分裂。
+- **根因**: `hermes --profile auditor` 启动时 `HERMES_HOME=~/.hermes/profiles/auditor`，
+  `get_process_hermes_home()` 便返回 profile 目录 ⇒ ① `_load_api_key()` 读 `profiles/auditor/.env`
+  （无 `BOCHA_API_KEY`）→ `is_available()` 为 False → 自动回落别的 keyless 后端；
+  ② `QUOTA_FILE` 指向 `profiles/auditor/data/.bocha_daily.json`，与网关那本账互不相认
+  （同一账号却各算 60/天，官方侧照样超额，且本地闸门永远不报）。
+- **改动**（`plugins/web/bocha/provider.py`）: 新增 `_account_home()` —— 仅对 `profiles/<name>`
+  形态向上两级回到安装根，其余（网关/单进程）行为不变；`QUOTA_FILE` 改用 `_ACCOUNT_HOME`；
+  `_load_api_key()` 改为 **process env → profile .env → 安装根 .env**。
+- **实测**: `HERMES_HOME=profiles/auditor` 下 `QUOTA_FILE=~/.hermes/data/.bocha_daily.json`、
+  `_load_api_key()` 有值、`is_available()=True`；auditor 端 `web_search` 返回叩富网（Bocha 中文源），
+  共享账本 `count` 51→52。回归 `tests/tools/test_web_providers.py` +
+  `tests/local/test_bocha_quota_atomic.py` = **15 passed**。
+- **重放验证**: `verify_patches.sh` 新增 `P14注入点5`（`_ACCOUNT_HOME` + env 优先 + `profiles` 判据）。
+- **回滚**: 恢复 `QUOTA_FILE = str(_HERMES_HOME / "data" / ".bocha_daily.json")` 与单文件读 key；
+  auditor 侧同时把 `web.search_backend` 改回 `searxng`。
+
 ### P15. cron 落库侧 rc 分流（rc 2 业务告警不再写成 error / 不再累加 failure_streak）— 2026-09-18 建立
 
 - **文件**: `cron/jobs.py`（`ALERT_EXIT_CODE` / `script_exit_code` / `_derived_last_status` /
@@ -1168,3 +1188,25 @@
 - **已验（2026-11-06 本机）**: 红 = 基线（`git checkout HEAD -- agent/chat_completion_helpers.py`，守卫断言补丁特征串为 0）上 `test_fallback_index_commit_after_bind.py` **3 failed / 1 passed**；绿 = 补丁后同文件 **4 passed**。邻接 13 文件：补丁后 `83 passed / 7 failed`，基线同文件集 `2 passed / 7 failed` —— 失败集合逐条相同（`test_empty_response_fallback_refund.py` 2 例 + `test_turn_recovery_autorecover.py` 5 例，全是 `tests/home_io_guard.py` 的 REAL hermes home 环境性失败，`test_malformed_tool_args_no_fallback.py` 2 例同上），零新增失败。
 - **重放验证**: `verify_patches.sh` 的 `P31注入点1..3`。
 - **退役条件**: 上游 `try_activate_fallback` 的游标在绑定成功后提交（验收: `git diff <tag> -- agent/chat_completion_helpers.py` 对本条为空）；`pr_candidate=True`，但 C3 闸门在途 PR 6/6 + 核心补丁 31/15 ⇒ `PR_INTENT="blocked"`，不开 PR。
+
+### P32. billing_base_url 尾斜杠把同一端点拆成两行 → 账单核对口径失真 — 2026-11-06 建立（待办 509949）
+
+- **文件**: `hermes_state_usage.py`（新增 `_normalize_billing_base_url()`，在 `update_token_counts()` / `record_auxiliary_usage()` 入口与 `_record_model_usage()` 的 UPSERT 参数处调用）；无仓库内测试（本仓 tests 走 `home_io_guard` 隔离，见下「已验」）。
+- **现象（取证，2026-11-06）**: `session_model_usage` 里同一 provider/同一密钥出现两组 `billing_base_url` —— `https://dashscope.aliyuncs.com/compatible-mode/v1` 18 行 vs 同串**带尾斜杠** 81 行；deepseek 更明显（`/v1` 2447 · `/v1/` 1479，且两态都在当日新增）。代价：按端点核对官方账单时同账号拆成两桶，`PRIMARY KEY(session_id, model, provider, base_url, mode, task)` 也把同一路由此拆成两行，逐端点汇总与供应商账单对不上。
+- **根因**: `str(openai.OpenAI(base_url="https://host/v1").base_url)` 规范化后是 `https://host/v1/`（httpx.URL 补尾斜杠）。凡是从 client 对象取 `base_url` 记账的路径（aux/title_generation、oneshot 主 loop）落带斜杠写法；从配置字符串取的路径（desktop 主 turn）不带 ⇒ 同端点两态。实测同一次 `hermes -z` 调用：主 turn 行落 `/v1/`、`title_generation` 行落 `/v1/`，而 desktop 会话主 turn 落 `/v1`。
+- **本次改动**: 记账前统一 `strip()` + `rstrip("/")`（裸根 `https://host/` → `https://host`）；三处入口全包，UPSERT 兜底再包一次，避免新增写入点绕过。
+- **不变量**: 不改请求实际使用 client 的 `base_url`（只改记账字段）；不改 `billing_provider` / `billing_mode` / PK 其余列；历史行不迁移（`/v1/` 存量保持原样，核对时按归一后端点聚合，避免一次改写历史成本统计）。
+- **已验（2026-11-06 本机）**: ① 相关测试文件 `tests/hermes_state/test_aux_usage_accounting.py` + `test_session_model_usage_pk_heal.py` **14 passed**；`tests/hermes_state/test_hermes_state.py` 的 103 条失败全为 `tests/home_io_guard.py` 的 `TEST BUG: file I/O against the REAL hermes home`（本机在 `~/.hermes` 之下跑 pytest 的既有环境红，失败集合与本次改动无关）；② 实测补丁后 `hermes --provider alibaba -m qwen3.8-flash -z`：新行 `billing_base_url=https://dashscope.aliyuncs.com/compatible-mode/v1`（无斜杠）、同时 `title_generation` 行也从带斜杠变无斜杠。
+- **重放验证**: `verify_patches.sh` 的 `P32注入点1..2`（helper 存在 + 两个入口均归一）。
+- **退役条件**: 上游在记账写入点对 `billing_base_url` 做等价归一（验收: `git diff <tag> -- hermes_state_usage.py` 对本条为空，且上游对 `str(client.base_url)` 带斜杠的路径有等价处理）；`pr_candidate=True`，但 C3 闸门在本侧净增提示线（核心补丁 32 / 阈值 15）⇒ `PR_INTENT="blocked"`，不开 PR。
+
+### P33. 技能主文档写入侧前移硬拦：余量 <10K 时拒收正文扩写 — 2026-11-08 建立（待办 136439）
+
+- **文件**: `tools/skill_manager_tool.py`（新增常量 `SKILL_BODY_HEADROOM_FLOOR = 10_000` + helper `_skill_body_growth_guard()`，挂点唯一地放在 `_guarded_write()` 的「目标已存在」分支）；测试: `tests/tools/test_skill_body_growth_guard.py`（新增 14 例 = 6 unit + 8 走真工具路径）。
+- **现象（取证，2026-11-04 改进队列 P2 / 2026-11-07 实测）**: 三个技能主文档已达 9.3–10.0 万字符（余量 126 / 917 一类）。撞上限后 `skill_manage` 的任何加法补丁恒被 `_validate_content_size` 拒收（它校验的是**结果内容**），唯一出路是绕开工具直改盘 —— 无原子替换、无安全扫描、无 ledger 留痕。
+- **根因**: 体积防线全在写入**之后**：工具侧只有 100K 终局拒收（late），架构周检 `check_skill_volume` 是 exit 2 告警 + 自动建条（after）。两者都不拦「正在逼近上限的这一次写入」⇒ 逼近过程无人拦，撞线后工具自身失效。
+- **本次改动**: ① 常量 `SKILL_BODY_HEADROOM_FLOOR = 10_000`；② `_skill_body_growth_guard(label, before, after)`：`headroom < floor` 且 `len(after) > len(before)` 时返回拒收文案（指向 `references/<topic>.md` + 主文档只留一行指针，或让本次写入净不增）；③ 挂点在 `_guarded_write()`：create / edit / patch / write_file 四条路径都经它，`skill_manager_batch` 也委托同一模块 ⇒ 没有「换个 action 绕过」的面。读不到原文件时 fail-open（`before=''` ⇒ headroom 视为充足）。
+- **不变量**: 只拦「增长」——缩身与净零重写永远放行（热文档仍可原地瘦身）；新建技能（target 不存在）不拦；`references/` 等附带文件不拦；100K 终局校验照旧（本闸是它前面的兆探，不替代）；不改 staging/审批闸、不改 lint 告警面。
+- **已验（2026-11-08 本机）**: ① 红 → 绿：基线（`git checkout HEAD -- tools/skill_manager_tool.py`，测试文件保留）**9 failed / 5 passed** ⇒ 补丁后 **14 passed**（`./venv/bin/python -m pytest tests/tools/test_skill_body_growth_guard.py`）；② 邻接 9 个 tools 测试文件 **159 passed / 3 failed**，三条失败在基线同一文件同样红（`TEST BUG: file I/O against the REAL hermes home`，`tests/home_io_guard.py` 环境红、非回归）；③ 生产真路径：对 `devops/test-gate-integrity/SKILL.md`（99,083 字符）实跑一次 `_patch_skill` 增长补丁 → 被拒（文案含 `references/`）且文件 sha256 未变。
+- **重放验证**: `verify_patches.sh` 的 `P33注入点1..3`（常量 / helper / `_guarded_write` 挂点）+ `P33契约`（回归用例文件在）。
+- **退役条件**: 上游在 SKILL.md 写入路径上自带「接近上限即拒增长」的等价闸（验收: `git diff <tag> -- tools/skill_manager_tool.py` 对本条为空，且上游对 `len(after) > len(before)` 的 SKILL.md 写入有 headroom 判据）；`pr_candidate=True`，但 C3 闸门核心补丁 33 / 阈值 15 ⇒ `PR_INTENT="blocked"`，不开 PR。

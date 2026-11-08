@@ -109,6 +109,13 @@ MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
 MAX_SKILL_CONTENT_CHARS = 100_000   # ~36k tokens at 2.75 chars/token
 MAX_SKILL_FILE_BYTES = 1_048_576    # 1 MiB per supporting file
+# Body-growth floor: a SKILL.md with less than this many characters of headroom to
+# MAX_SKILL_CONTENT_CHARS accepts no growth at all (shrinking / net-neutral writes stay
+# allowed). Near the cap the next sizeable lesson tips the file over the limit, and a
+# rejected write leaves no in-tool path but editing the file behind the tool's back —
+# no atomic replace, no security scan, no ledger. Blocking growth while headroom still
+# exists keeps growth where it belongs: references/ files, with SKILL.md staying an index.
+SKILL_BODY_HEADROOM_FLOOR = 10_000
 VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')  # filesystem-safe, URL-friendly
 ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets"}  # for write_file/remove_file
 _FRONTMATTER_END_RE = re.compile(r'\n---\s*\n')
@@ -186,6 +193,26 @@ def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[st
             f"Consider splitting into a smaller SKILL.md with supporting files in references/ "
             f"or templates/.")
     return None
+
+
+def _skill_body_growth_guard(label: str, before: str, after: str) -> Optional[str]:
+    """Reject growth of a SKILL.md whose headroom to the content cap is nearly spent.
+
+    ``before`` is the on-disk text ('' when unreadable — the check then cannot measure
+    headroom and must fail open). Only growth is refused: a rewrite that shrinks or keeps
+    the size is always allowed, so a hot document can still be slimmed in place.
+    """
+    headroom = MAX_SKILL_CONTENT_CHARS - len(before)
+    grew = len(after) - len(before)
+    if headroom >= SKILL_BODY_HEADROOM_FLOOR or grew <= 0:
+        return None
+    return (
+        f"{label} is {len(before):,} characters — only {headroom:,} of the "
+        f"{MAX_SKILL_CONTENT_CHARS:,} limit left (growth floor: {SKILL_BODY_HEADROOM_FLOOR:,}). "
+        f"This write grows the body by {grew:,} characters and was refused. Put the new "
+        f"material in a supporting file — skill_manage(action='write_file', "
+        f"file_path='references/<topic>.md', ...) — and leave a one-line pointer in SKILL.md; "
+        f"or make this write net-neutral by trimming what it replaces.")
 
 
 def _description_preview(content: str) -> str:
@@ -401,6 +428,9 @@ def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label:
         if read_guard := _background_review_read_before_write_guard(name, target, action, label):
             return read_guard
         original = target.read_text(encoding="utf-8-sig")
+        if target.name == "SKILL.md":
+            if growth_err := _skill_body_growth_guard(label, original, content):
+                return _err(growth_err)
     from hermes_constants import mkdir_under_hermes_home
     mkdir_under_hermes_home(target.parent)
     atomic_write_text(target, content, preserve_mode=True, create_mode=0o644)

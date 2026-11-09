@@ -2254,19 +2254,80 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     render(<Harness />)
     await flushAsync()
 
-    // Exhaust the bounded retry budget (5 attempts, ≤15s jittered delay each).
-    for (let i = 0; i < 7; i += 1) {
-      await advanceBackoff()
+    // Exhaust the bounded retry budget (6 attempts: 1s/2s/4s then 30s/2min/5min).
+    for (let i = 0; i < 8; i += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120_000)
+      })
     }
 
-    // 1 initial + 5 bounded retries; the loop then STOPS retrying and the
+    // 1 initial + 6 bounded retries; the loop then STOPS retrying and the
     // terminal boot error surfaces the real recovery affordance.
-    expect(desktop.getConnection).toHaveBeenCalledTimes(6)
+    expect(desktop.getConnection).toHaveBeenCalledTimes(7)
     expect($desktopBoot.get().error).toBeTruthy()
 
     // No further attempts after the budget is spent — bounded, not infinite.
-    await advanceBackoff()
-    expect(desktop.getConnection).toHaveBeenCalledTimes(6)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(600_000)
+    })
+    expect(desktop.getConnection).toHaveBeenCalledTimes(7)
+  })
+
+  it('a boot that gave up after its retry budget restarts when the network comes back (2026-11-03 laptop incident)', async () => {
+    // The reported class: the desktop launches before its Wi-Fi/AP is up, the
+    // quick retries burn out inside a few seconds, and the app sits on the
+    // recovery overlay even though the network returns two minutes later.
+    // A terminal give-up must keep one wake path: the OS 'online' event
+    // re-enters boot once, without the user clicking Retry.
+    const desktop = fakeDesktop()
+    let networkUp = false
+    desktop.getConnection = vi.fn(async () => {
+      if (!networkUp) {
+        throw new Error('Could not verify the existing SSH backend.')
+      }
+
+      return remotePrimaryConn
+    })
+    desktop.getBootProgress = vi.fn(async () => ({
+      error: networkUp ? null : 'Could not verify the existing SSH backend.',
+      fakeMode: false,
+      message: 'Desktop boot failed',
+      phase: networkUp ? 'backend.ready' : 'backend.error',
+      progress: networkUp ? 100 : 24,
+      retryable: !networkUp,
+      running: networkUp,
+      timestamp: Date.now()
+    }))
+    ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
+    FakeWebSocket.mode = 'open'
+
+    render(<Harness />)
+    await flushAsync()
+
+    for (let i = 0; i < 8; i += 1) {
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120_000)
+      })
+    }
+
+    const attemptsAtGiveUp = desktop.getConnection.mock.calls.length
+    expect($desktopBoot.get().error).toBeTruthy()
+
+    // Network returns; the OS emulates the `online` event.
+    networkUp = true
+    await act(async () => {
+      window.dispatchEvent(new Event('online'))
+      await Promise.resolve()
+    })
+    await flushAsync()
+
+    expect(desktop.getConnection.mock.calls.length).toBeGreaterThan(attemptsAtGiveUp)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000)
+    })
+    await flushAsync()
+    expect($gatewayState.get()).toBe('open')
+    expect($desktopBoot.get().error).toBeNull()
   })
 
   it('a failed cold boot keeps its recovery surface while main replays cold-boot progress behind it (#112899)', async () => {

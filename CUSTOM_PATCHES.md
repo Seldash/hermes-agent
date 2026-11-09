@@ -1221,3 +1221,13 @@
 - **已验（2026-11-09 本机）**: ① 校验器 12 条表驱动用例全 PASS（含 `[]`/`None`/`context_engine`/`*`/字符串形态/双错名）；② `tests/cron/test_cron_unknown_toolset_rejected.py` + `test_cron_explicit_empty_toolsets.py` **9 passed**（含「rejected create 不落盘」「rejected update 不改原值」）；③ 邻接 `tests/tools/test_cronjob_tools.py` **72 passed**（零回归）。
 - **重放验证**: `verify_patches.sh` 的 `P34注入点1..3`（`difflib` 导入 / `_validate_toolsets` 定义 / create 校验链挂点 / update 挂点）+ `P34契约`（回归用例文件在）。
 - **退役条件**: 上游在 cronjob create/update 对 `enabled_toolsets` 做名字校验（验收: `git diff <tag> -- tools/cronjob_tools.py` 对本条为空，且 `resolve_toolset` 未知名返回非空或调用侧报错）；`pr_candidate=True`，但 C3 闸门核心补丁 34 / 阈值 15 ⇒ `PR_INTENT="blocked"`，不开 PR。
+
+### P35. 桌面端远程 boot 重试 6 秒烧完即停恢复页：网络回来不自启 — 2026-11-09 建立（待办 733127）
+
+- **文件**: `apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts`（`BOOT_RETRY_DELAYS_MS` 阶梯 + `retryBootAfterNetworkReturn()`）；测试 `apps/desktop/src/app/gateway/hooks/use-gateway-boot.test.tsx`（重试预算断言改 7 次调用 + 新增 online 自启用例）。
+- **现象（取证，2026-11-03 笔记本事故 / trantor 请求 20261103_100829 + 上游 #82679）**: 远程 boot 用固定 2s 基数、最多 5 次尝试 ⇒ 网络未就绪时约 6 秒烧完预算，界面停在恢复页；网络一分钟后回来也不会自启，必须人工点 Retry。笔记本上「开机→连上 Wi-Fi」的时序天然落在这个窗口里。
+- **本次改动**: ① 重试延迟改显式阶梯 `[1s, 2s, 4s, 30s, 2min, 5min]`（总窗口 ≈7.6 分钟，仍为有界预算）；② 预算耗尽后保留**一条**唤醒路径：`window` 收到 `online` 事件时，若 `bootFailed` 且未 `bootCompleted`，重置尝试计数并重入 `boot()`。
+- **不变量**: 仍是有界重试（预算耗尽后不再按计时器自动重试，恢复面照旧给出 Retry/Settings）；本地失败与已确认的 reauth 拒绝不进该循环；online 唤醒只在 bootFailed 且未完成时触发，不改变正常路径的 socket 重连语义。
+- **已验（2026-11-09 本机）**: `cd apps/desktop && ../../node_modules/.bin/vitest run src/app/gateway/hooks/use-gateway-boot.test.tsx` → **77 passed**（含新增「放弃后网络恢复自启」用例与 7 次调用的预算断言）。**注**：apps/desktop/node_modules 只有 9 个包、无本地 vitest；node 解析上溯到仓库根 node_modules 即可跑，**无需 npm ci**（此前「无法验证」的判断据此作废）。
+- **重放验证**: `verify_patches.sh` 的 `P35注入点1..3`（阶梯常量 / 阶梯被重试路径使用 / online 唤醒重入存在）+ `P35契约`（online 自启用例在）。
+- **退役条件**: 上游 `use-gateway-boot.ts` 自带重试阶梯与 online 唤醒（验收: `git diff <tag> -- apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts` 对本条为空，且耗尽后的恢复面不再一次性）；`pr_candidate=True`，但 C3 闸门核心补丁 35 / 阈值 15 ⇒ `PR_INTENT="blocked"`，不开 PR。

@@ -144,10 +144,14 @@ const WAKE_RECONNECT_HOLDOFF_MS = 15_000
 // and end in the real recovery affordance (the boot-failure overlay with
 // Retry / Settings), never an infinite spinner. Local failures and confirmed
 // reauth rejections never enter this loop.
-const BOOT_RETRY_MAX_ATTEMPTS = 5
-// Base delay for boot retries. Deliberately slower than the socket reconnect
-// loop's 300ms: each attempt may rebuild an SSH master + remote dashboard.
-const BOOT_RETRY_BASE_DELAY_MS = 2_000
+// Retry schedule for a failed REMOTE boot (#82679 + wj trantor 请求
+// 20261103_100829): three quick attempts, then 30s / 2min / 5min so a boot that
+// starts before the network is up (Wi-Fi/AP still connecting) survives the
+// blip instead of parking on the recovery overlay. Total ≈ 7.6 min, bounded.
+// A terminal give-up also arms a one-shot `online` wake that restarts the boot
+// as soon as the OS reports the network back.
+const BOOT_RETRY_DELAYS_MS = [1_000, 2_000, 4_000, 30_000, 120_000, 300_000] as const
+const BOOT_RETRY_MAX_ATTEMPTS = BOOT_RETRY_DELAYS_MS.length
 
 // While any of the RECONNECT_ATTEMPT_TIMEOUT_MS-bounded awaits below is
 // pending, `reconnecting` never clears, so scheduleReconnect()/
@@ -1322,7 +1326,30 @@ export function useGatewayBoot({
       }
     })
 
-    const onOnline = () => void forceReconnectNow()
+    // Terminal boot give-up (retry budget exhausted) still leaves one wake
+    // path: the OS reporting the network back. Without this, an AP/Wi-Fi that
+    // appears seconds after launch leaves the app parked on the recovery
+    // overlay until the user clicks Retry (2026-11-03 laptop incident,
+    // coordination request 20261103_100829).
+    function retryBootAfterNetworkReturn() {
+      if (cancelled || bootCompleted || !bootFailed) {
+        return
+      }
+
+      bootRetryAttempt = 0
+      bootFailed = false
+      resumeDesktopBootForRetry(translateNow('boot.steps.retryingRemoteBackend'))
+      clearBootRetryTimer()
+      bootRetryTimer = setTimeout(() => {
+        bootRetryTimer = null
+        void boot()
+      }, 0)
+    }
+
+    const onOnline = () => {
+      void forceReconnectNow()
+      retryBootAfterNetworkReturn()
+    }
 
     const onVisible = () => {
       if (document.visibilityState === 'visible') {
@@ -1615,7 +1642,7 @@ export function useGatewayBoot({
           const retryable = canRetry && (stage === 'dialing' || (await bootFailureIsRetryable()))
 
           if (retryable && !cancelled) {
-            const delay = reconnectBackoffDelayMs(bootRetryAttempt, { baseDelayMs: BOOT_RETRY_BASE_DELAY_MS })
+            const delay = BOOT_RETRY_DELAYS_MS[Math.min(bootRetryAttempt, BOOT_RETRY_MAX_ATTEMPTS - 1)]
             bootRetryAttempt += 1
             bootFailed = false
             resumeDesktopBootForRetry(translateNow('boot.steps.retryingRemoteBackend'))

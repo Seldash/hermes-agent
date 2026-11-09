@@ -24,6 +24,7 @@ import tempfile
 import urllib.request
 import urllib.error
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict
 
 from agent.web_search_provider import WebSearchProvider
@@ -37,19 +38,43 @@ BOCHA_API_URL = "https://api.bochaai.com/v1/web-search"
 # 故取 get_process_hermes_home()（与请求上下文里的 profile override 无关），不吃
 # get_hermes_home()（它会跟随 routed-profile 作用域）。同源真身 ~/.hermes/data/.bocha_daily.json。
 _HERMES_HOME = get_process_hermes_home()
-QUOTA_FILE = str(_HERMES_HOME / "data" / ".bocha_daily.json")
+
+
+def _account_home() -> Path:
+    """Bocha 账号级配置根：profile 进程要向上回到安装根。
+
+    Bocha 的 API key 与日/月配额属于**账号**，不属于某个 profile。``hermes --profile X``
+    启动时 ``HERMES_HOME`` 被指到 ``profiles/X``，于是 ``get_process_hermes_home()`` 返回
+    profile 目录：账本被切到 ``profiles/X/data/``（与网关进程分裂成两本账），且
+    ``profiles/X/.env`` 通常没有 ``BOCHA_API_KEY`` ⇒ ``is_available()`` 为 False，
+    web_search 静默回落别的后端（2026-11-06 实测：auditor 配 bocha 却拿到 exa 结果）。
+    这里只对 ``profiles/<name>`` 形态向上取两级，其余（网关/单进程）行为不变。
+    """
+    h = _HERMES_HOME
+    return h.parent.parent if h.parent.name == "profiles" else h
+
+
+_ACCOUNT_HOME = _account_home()
+QUOTA_FILE = str(_ACCOUNT_HOME / "data" / ".bocha_daily.json")
 DEFAULT_DAILY_LIMIT = 50
 DEFAULT_MONTHLY_LIMIT = 1000
 
 
 def _load_api_key() -> str | None:
-    """Load BOCHA_API_KEY from .env file."""
-    env_path = _HERMES_HOME / ".env"
-    if not env_path.exists():
-        return None
-    for line in env_path.read_text(encoding="utf-8").splitlines():
-        if line.startswith("BOCHA_API_KEY="):
-            return line.split("=", 1)[1].strip().strip('"').strip("'")
+    """Resolve BOCHA_API_KEY: process env → profile .env → install-root .env.
+
+    进程环境优先，因为 Hermes 启动时已按「profile .env 覆盖根 .env」的优先级合并注入；
+    文件回退用于未注入的独立调用方。
+    """
+    key = (os.environ.get("BOCHA_API_KEY") or "").strip()
+    if key:
+        return key
+    for env_path in (_HERMES_HOME / ".env", _ACCOUNT_HOME / ".env"):
+        if not env_path.exists():
+            continue
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            if line.startswith("BOCHA_API_KEY="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
     return None
 
 

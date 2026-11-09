@@ -665,6 +665,7 @@
   共享账本 `count` 51→52。回归 `tests/tools/test_web_providers.py` +
   `tests/local/test_bocha_quota_atomic.py` = **15 passed**。
 - **重放验证**: `verify_patches.sh` 新增 `P14注入点5`（`_ACCOUNT_HOME` + env 优先 + `profiles` 判据）。
+- **回归用例（2026-11-09 补）**: 该修订此前只有一次性实测、**无专项用例**，且源码一直未提交（只有登记在盘 ⇒ 升级 reset 后会变成「有登记无代码」）。现补 `tests/local/test_bocha_account_scope.py` 4 例覆盖 5 条判据（profile 上溯 / 非 profile 恒等 / profile 进程落账号账本 / key 四级顺序含缺 key 返回 None），与既有 P14 原子性 5 例合计 **9 passed**；`verify_patches.sh` 增 `P14契约` 盯该用例文件。
 - **回滚**: 恢复 `QUOTA_FILE = str(_HERMES_HOME / "data" / ".bocha_daily.json")` 与单文件读 key；
   auditor 侧同时把 `web.search_backend` 改回 `searxng`。
 

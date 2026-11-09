@@ -1210,6 +1210,7 @@
 - **已验（2026-11-08 本机）**: ① 红 → 绿：基线（`git checkout HEAD -- tools/skill_manager_tool.py`，测试文件保留）**9 failed / 5 passed** ⇒ 补丁后 **14 passed**（`./venv/bin/python -m pytest tests/tools/test_skill_body_growth_guard.py`）；② 邻接 9 个 tools 测试文件 **159 passed / 3 failed**，三条失败在基线同一文件同样红（`TEST BUG: file I/O against the REAL hermes home`，`tests/home_io_guard.py` 环境红、非回归）；③ 生产真路径：对 `devops/test-gate-integrity/SKILL.md`（99,083 字符）实跑一次 `_patch_skill` 增长补丁 → 被拒（文案含 `references/`）且文件 sha256 未变。
 - **重放验证**: `verify_patches.sh` 的 `P33注入点1..3`（常量 / helper / `_guarded_write` 挂点）+ `P33契约`（回归用例文件在）。
 - **退役条件**: 上游在 SKILL.md 写入路径上自带「接近上限即拒增长」的等价闸（验收: `git diff <tag> -- tools/skill_manager_tool.py` 对本条为空，且上游对 `len(after) > len(before)` 的 SKILL.md 写入有 headroom 判据）；`pr_candidate=True`，但 C3 闸门核心补丁 33 / 阈值 15 ⇒ `PR_INTENT="blocked"`，不开 PR。
+- **后续（2026-11-09）**: 本条只拦「余量 <10K」；正文 ≥20K 时的前移门由 `### P36` 接续（同一函数扩成两级，同一 check 名 `P36注入点*`）。
 
 ### P34. 未知名 toolset 静默解析为空集 → 作业少整个工具面（cronjob create/update 无校验）— 2026-11-09 建立（待办 256820）
 
@@ -1231,3 +1232,12 @@
 - **已验（2026-11-09 本机）**: `cd apps/desktop && ../../node_modules/.bin/vitest run src/app/gateway/hooks/use-gateway-boot.test.tsx` → **77 passed**（含新增「放弃后网络恢复自启」用例与 7 次调用的预算断言）。**注**：apps/desktop/node_modules 只有 9 个包、无本地 vitest；node 解析上溯到仓库根 node_modules 即可跑，**无需 npm ci**（此前「无法验证」的判断据此作废）。
 - **重放验证**: `verify_patches.sh` 的 `P35注入点1..3`（阶梯常量 / 阶梯被重试路径使用 / online 唤醒重入存在）+ `P35契约`（online 自启用例在）。
 - **退役条件**: 上游 `use-gateway-boot.ts` 自带重试阶梯与 online 唤醒（验收: `git diff <tag> -- apps/desktop/src/app/gateway/hooks/use-gateway-boot.ts` 对本条为空，且耗尽后的恢复面不再一次性）；`pr_candidate=True`，但 C3 闸门核心补丁 35 / 阈值 15 ⇒ `PR_INTENT="blocked"`，不开 PR。
+### P36. 技能主文档写入侧前移拦：≥20K 字符只收 ≤800 字符补丁（有期豁免）— 2026-11-09 建立（待办 809235 ②）
+
+- **文件**: `tools/skill_manager_tool.py`（`SKILL_BODY_REF_GATE_CHARS` / `SKILL_BODY_PATCH_TOLERANCE` / `_body_ref_gate_enabled()` / `_skill_rel_key()` / `_consume_body_gate_exemption()`，`_skill_body_growth_guard()` 扩成两级）；测试 `tests/tools/test_skill_body_growth_guard.py`（`class TestFrontGate`）。
+- **现象（取证，2026-11-02 复核）**: 写入侧只有两道关 —— 100K 终局拒收与 P33 的「余量 <10K 拒增长」。等余量烧到 10K 才拦已经太晚：`script-refactor-safety` 实测 99,995 字符、余量 5 字符，下一次 `skill_manage` 补丁被直接拒收，唯一出路是绕开工具直改盘（无原子替换、无校验、无 ledger）。90K 的 WARN 只在被扫到时打一条，既不给余量也不拦新增。
+- **本次改动**: 两级门槛，顺序判定 —— ① `headroom < SKILL_BODY_HEADROOM_FLOOR`（10K）：任何增长一律拒（P33 原样）；② 正文 `>= SKILL_BODY_REF_GATE_CHARS`（20,000 字符，现役库位数上四分位）时，增长 `> SKILL_BODY_PATCH_TOLERANCE`（800 字符）判为「新材料」而拒，错误串直接给出 `write_file references/<topic>.md` 的改法，并指向豁免授权脚本 `skills/devops/skill-volume-governance/scripts/grant_body_gate_exempt.py`。豁免落 `data/skill_body_gate_exempt.json`（per `rel`，可带 `expires` / `max_growth` / `uses_left`），每次使用写 `data/skill_body_gate_exempt_log.jsonl` 并递减次数；kill switch `SKILL_BODY_REF_GATE=0` 整体回退到「只按余量拦」。
+- **不变量**: 缩小与净零写入永远放行（热文档仍可就地瘦身）；<20K 的文档完全不受第②条影响；`rel` 取 `<category>/<name>/SKILL.md`，与体量预算台账同一形状；豁免台账读/写异常一律**不放行**（fail-closed，坏台账不能变永久白名单）；豁免有界（次数用完或过期即失效）。
+- **已验（2026-11-09 本机）**: `./venv/bin/python -m pytest tests/tools/test_skill_body_growth_guard.py -q` → **27 passed**（含大文档大增长被拒 / 大文档小补丁放行 / 豁免生效并递减 / kill switch 回退 / 缩小放行）。
+- **重放验证**: `verify_patches.sh` 的 `P36注入点1..5`（20K 阈值常量 / 800 容差 / 豁免消费 helper / kill switch 常量 / `_guarded_write` 传 rel 的挂点）+ `P36契约`（`class TestFrontGate` 在）。
+- **退役条件**: 上游写入侧自带「大文档只收小补丁 + 指向 references/」的等价判据（验收: `git diff <tag> -- tools/skill_manager_tool.py` 对本条为空，且上游对 `len(after) - len(before) > 阈值` 的大文档写入有拒收路径）；`pr_candidate=True`，但 C3 闸门核心补丁 36 / 阈值 15 ⇒ `PR_INTENT="blocked"`，不开 PR。

@@ -10,10 +10,12 @@ existing skills (bundled, hub, user) are modified in place. Layout:
 import contextvars as _ctxvars
 import hashlib
 import json
-from contextlib import ExitStack, suppress
+import os
 import logging
 import re
 import shutil
+import time
+from contextlib import ExitStack, suppress
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -116,6 +118,22 @@ MAX_SKILL_FILE_BYTES = 1_048_576    # 1 MiB per supporting file
 # no atomic replace, no security scan, no ledger. Blocking growth while headroom still
 # exists keeps growth where it belongs: references/ files, with SKILL.md staying an index.
 SKILL_BODY_HEADROOM_FLOOR = 10_000
+
+# Front gate (wj 809235, 2026-11-08): the 90K warning arrives too late — by the time a
+# body is that large the write path already refuses *every* net increase, so the only
+# route left is editing the file behind the tool's back. So a LARGE body accepts only
+# small patches; new material belongs in references/. 20,000 chars is the top quartile of
+# the live library (median ~11.8K): below it a doc still has >=80K of headroom and policing
+# growth buys nothing.
+SKILL_BODY_REF_GATE_CHARS = 20_000
+# Growth up to this reads as an ordinary patch (typo, one judgement line, a version bump).
+# Above it reads as new material -> references/<topic>.md + a one-line pointer.
+SKILL_BODY_PATCH_TOLERANCE = 800
+# Kill switch + per-skill exemption ledger: a legitimate large patch to an existing big doc
+# must never force a hand-edit. Exemptions are per rel, expiring, bounded and logged.
+SKILL_BODY_REF_GATE_ENV = "SKILL_BODY_REF_GATE"
+SKILL_BODY_EXEMPT_LEDGER = Path("data") / "skill_body_gate_exempt.json"
+SKILL_BODY_EXEMPT_LOG = Path("data") / "skill_body_gate_exempt_log.jsonl"
 VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')  # filesystem-safe, URL-friendly
 ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets"}  # for write_file/remove_file
 _FRONTMATTER_END_RE = re.compile(r'\n---\s*\n')
@@ -195,24 +213,110 @@ def _validate_content_size(content: str, label: str = "SKILL.md") -> Optional[st
     return None
 
 
-def _skill_body_growth_guard(label: str, before: str, after: str) -> Optional[str]:
-    """Reject growth of a SKILL.md whose headroom to the content cap is nearly spent.
+def _body_ref_gate_enabled() -> bool:
+    """Kill switch: ``SKILL_BODY_REF_GATE=0`` reverts to the headroom-only block."""
+    return str(os.environ.get(SKILL_BODY_REF_GATE_ENV, "")).strip().lower() not in {
+        "0", "off", "false", "no"}
 
-    ``before`` is the on-disk text ('' when unreadable — the check then cannot measure
-    headroom and must fail open). Only growth is refused: a rewrite that shrinks or keeps
-    the size is always allowed, so a hot document can still be slimmed in place.
+
+def _skill_rel_key(skill_dir: Path) -> str:
+    """Ledger key for a skill — ``<category>/<name>/SKILL.md``, the same shape the size
+    budget ledger uses, so an exemption is named exactly like every other reading."""
+    try:
+        rel = Path(skill_dir).resolve().relative_to(_skills_dir().resolve())
+        return (rel / "SKILL.md").as_posix()
+    except Exception:
+        return f"{Path(skill_dir).name}/SKILL.md"
+
+
+def _consume_body_gate_exemption(rel: str, grew: int, after_chars: int) -> Optional[str]:
+    """Return the exemption reason for ``rel`` when it covers this write, else None.
+
+    An entry is ``{"reason": str, "expires": "YYYY-MM-DD", "max_growth": int,
+    "uses_left": int}``; all fields but ``reason`` are optional. A granted use is logged
+    (one jsonl line) and ``uses_left`` is decremented, so an exemption is auditable and
+    cannot quietly turn into a permanent hole. Any I/O problem returns None — a broken
+    ledger must never grant a pass.
+    """
+    if not rel:
+        return None
+    home = Path(get_hermes_home())
+    ledger_path = home / SKILL_BODY_EXEMPT_LEDGER
+    try:
+        data = json.loads(ledger_path.read_text(encoding="utf-8"))
+        entry = (data.get("exemptions") or {}).get(rel)
+        if not isinstance(entry, dict):
+            return None
+        expires = str(entry.get("expires") or "").strip()
+        if expires and expires < time.strftime("%Y-%m-%d"):
+            return None
+        cap = entry.get("max_growth")
+        if isinstance(cap, int) and grew > cap:
+            return None
+        uses = entry.get("uses_left")
+        if isinstance(uses, int):
+            if uses <= 0:
+                return None
+            entry["uses_left"] = uses - 1
+            if entry["uses_left"] == 0:
+                entry["exhausted_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        record = {"at": time.strftime("%Y-%m-%dT%H:%M:%S"), "rel": rel, "grew": grew,
+                  "chars_after": after_chars, "reason": entry.get("reason", ""),
+                  "uses_left": entry.get("uses_left"), "expires": expires or None}
+        log_path = home / SKILL_BODY_EXEMPT_LOG
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+        ledger_path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+        return str(entry.get("reason") or "exempt")
+    except Exception:
+        logger.debug("body-gate exemption ledger unreadable", exc_info=True)
+        return None
+
+
+def _skill_body_growth_guard(label: str, before: str, after: str, *,
+                             rel: Optional[str] = None,
+                             allow_exempt: bool = True) -> Optional[str]:
+    """Refuse body growth that belongs in ``references/`` instead.
+
+    Two tiers, checked in order:
+
+    1. headroom — less than ``SKILL_BODY_HEADROOM_FLOOR`` to the 100K cap: no growth at all.
+    2. front gate — body already >= ``SKILL_BODY_REF_GATE_CHARS``: growth beyond
+       ``SKILL_BODY_PATCH_TOLERANCE`` is new material, not a patch.
+
+    ``before`` is the on-disk text ('' when unreadable — the check then cannot measure and
+    must fail open). Shrinking and net-neutral writes always pass, so a hot document can
+    still be slimmed in place. Tier 2 can be lifted for one skill by an exemption entry
+    (``rel``), which is recorded; tier 1 stays as-is.
     """
     headroom = MAX_SKILL_CONTENT_CHARS - len(before)
     grew = len(after) - len(before)
-    if headroom >= SKILL_BODY_HEADROOM_FLOOR or grew <= 0:
+    if grew <= 0:
         return None
-    return (
-        f"{label} is {len(before):,} characters — only {headroom:,} of the "
-        f"{MAX_SKILL_CONTENT_CHARS:,} limit left (growth floor: {SKILL_BODY_HEADROOM_FLOOR:,}). "
-        f"This write grows the body by {grew:,} characters and was refused. Put the new "
-        f"material in a supporting file — skill_manage(action='write_file', "
-        f"file_path='references/<topic>.md', ...) — and leave a one-line pointer in SKILL.md; "
-        f"or make this write net-neutral by trimming what it replaces.")
+    if headroom < SKILL_BODY_HEADROOM_FLOOR:
+        return (
+            f"{label} is {len(before):,} characters — only {headroom:,} of the "
+            f"{MAX_SKILL_CONTENT_CHARS:,} limit left (growth floor: {SKILL_BODY_HEADROOM_FLOOR:,}). "
+            f"This write grows the body by {grew:,} characters and was refused. Put the new "
+            f"material in a supporting file — skill_manage(action='write_file', "
+            f"file_path='references/<topic>.md', ...) — and leave a one-line pointer in SKILL.md; "
+            f"or make this write net-neutral by trimming what it replaces.")
+    if (_body_ref_gate_enabled() and len(before) >= SKILL_BODY_REF_GATE_CHARS
+            and grew > SKILL_BODY_PATCH_TOLERANCE):
+        if allow_exempt and _consume_body_gate_exemption(rel or "", grew, len(after)):
+            return None
+        return (
+            f"{label} is {len(before):,} characters{'' if not rel else ' (' + rel + ')'} — past the "
+            f"{SKILL_BODY_REF_GATE_CHARS:,}-character front gate, which accepts only patches up to "
+            f"{SKILL_BODY_PATCH_TOLERANCE:,} characters. This write adds {grew:,}. New material "
+            f"belongs in a supporting file — skill_manage(action='write_file', "
+            f"file_path='references/<topic>.md', ...) — with a one-line pointer left in SKILL.md. "
+            f"If it really must land in the body, grant a bounded exemption for that skill: "
+            f"python3 ~/.hermes/skills/devops/skill-volume-governance/scripts/"
+            f"grant_body_gate_exempt.py --rel {rel or '<rel>'} --reason '<why>' --days N "
+            f"(per skill, logged, expires).")
+    return None
 
 
 def _description_preview(content: str) -> str:
@@ -429,7 +533,8 @@ def _guarded_write(name: str, skill_dir: Path, target: Path, action: str, label:
             return read_guard
         original = target.read_text(encoding="utf-8-sig")
         if target.name == "SKILL.md":
-            if growth_err := _skill_body_growth_guard(label, original, content):
+            if growth_err := _skill_body_growth_guard(
+                    label, original, content, rel=_skill_rel_key(skill_dir)):
                 return _err(growth_err)
     from hermes_constants import mkdir_under_hermes_home
     mkdir_under_hermes_home(target.parent)

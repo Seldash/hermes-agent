@@ -177,3 +177,123 @@ class TestGuardThroughTool:
         at_cap = _content("at-cap-new", MAX_SKILL_CONTENT_CHARS - 100)
         result = json.loads(skill_manage(action="create", name="at-cap-new", content=at_cap))
         assert result["success"] is True
+
+
+class TestFrontGate:
+    """Front gate (wj 809235): a body past SKILL_BODY_REF_GATE_CHARS only takes patches.
+
+    The 90K warning arrives after the point where the write path refuses all growth, so
+    big bodies are steered to references/ while they still have headroom. Ordinary patches
+    keep working; a legitimate large patch is lifted per skill by a bounded exemption.
+    """
+
+    @staticmethod
+    def _guard(before, after, rel=None):
+        from tools.skill_manager_tool import _skill_body_growth_guard
+        return _skill_body_growth_guard("SKILL.md", before, after, rel=rel)
+
+    @staticmethod
+    def _exempt(tmp_path, rel, **entry):
+        import json as _json
+        path = tmp_path / "data" / "skill_body_gate_exempt.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_json.dumps({"schema": 1, "exemptions": {rel: entry}},
+                                    ensure_ascii=False), encoding="utf-8")
+        return path
+
+    def test_big_body_large_growth_refused(self):
+        before = "y" * 21_000
+        err = self._guard(before, before + "z" * 2_000, rel="devops/demo/SKILL.md")
+        assert err is not None
+        assert "front gate" in err and "references/" in err
+
+    def test_big_body_small_patch_allowed(self):
+        before = "y" * 21_000
+        assert self._guard(before, before + "z" * 500) is None
+
+    def test_big_body_net_neutral_allowed(self):
+        before = "y" * 21_000
+        assert self._guard(before, before) is None
+
+    def test_body_just_under_gate_grows_freely(self):
+        from tools.skill_manager_tool import SKILL_BODY_REF_GATE_CHARS
+        before = "y" * (SKILL_BODY_REF_GATE_CHARS - 1)
+        assert self._guard(before, before + "z" * 5_000) is None
+
+    def test_kill_switch_restores_old_behaviour(self, monkeypatch):
+        monkeypatch.setenv("SKILL_BODY_REF_GATE", "0")
+        before = "y" * 21_000
+        assert self._guard(before, before + "z" * 2_000) is None
+
+    def test_exemption_lifts_gate_for_that_rel_and_is_logged(self, tmp_path):
+        rel = "devops/demo/SKILL.md"
+        ledger = self._exempt(tmp_path, rel, reason="整节重排", expires="2099-01-01", uses_left=2)
+        before = "y" * 21_000
+        assert self._guard(before, before + "z" * 2_000, rel=rel) is None
+        log = tmp_path / "data" / "skill_body_gate_exempt_log.jsonl"
+        lines = log.read_text(encoding="utf-8").strip().splitlines()
+        assert len(lines) == 1 and json.loads(lines[0])["rel"] == rel
+        assert json.loads(ledger.read_text(encoding="utf-8"))["exemptions"][rel]["uses_left"] == 1
+        # A different skill is not covered by that exemption.
+        assert self._guard(before, before + "z" * 2_000, rel="devops/other/SKILL.md") is not None
+
+    def test_exhausted_exemption_refused(self, tmp_path):
+        rel = "devops/demo/SKILL.md"
+        self._exempt(tmp_path, rel, reason="用过一次", expires="2099-01-01", uses_left=0)
+        before = "y" * 21_000
+        assert self._guard(before, before + "z" * 2_000, rel=rel) is not None
+
+    def test_expired_exemption_refused(self, tmp_path):
+        rel = "devops/demo/SKILL.md"
+        self._exempt(tmp_path, rel, reason="过期了", expires="2020-01-01")
+        before = "y" * 21_000
+        assert self._guard(before, before + "z" * 2_000, rel=rel) is not None
+
+    def test_max_growth_cap_enforced(self, tmp_path):
+        rel = "devops/demo/SKILL.md"
+        self._exempt(tmp_path, rel, reason="只允许小改", expires="2099-01-01", max_growth=1_000)
+        before = "y" * 21_000
+        assert self._guard(before, before + "z" * 900, rel=rel) is None
+        assert self._guard(before, before + "z" * 1_500, rel=rel) is not None
+
+    def test_broken_ledger_never_grants_a_pass(self, tmp_path):
+        path = tmp_path / "data" / "skill_body_gate_exempt.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json", encoding="utf-8")
+        before = "y" * 21_000
+        assert self._guard(before, before + "z" * 2_000, rel="devops/demo/SKILL.md") is not None
+
+
+class TestFrontGateThroughTool:
+    """The gate is wired into the real write path, not just the pure function."""
+
+    def test_patch_large_growth_refused_on_big_skill(self, isolate_skills):
+        big = _content("big-skill", 21_000)
+        json.loads(skill_manage(action="create", name="big-skill", content=big))
+
+        result = json.loads(skill_manage(
+            action="patch", name="big-skill",
+            old_string="# Test Skill\n\n", new_string="# Test Skill\n\n" + "lesson " * 300))
+        assert result["success"] is False
+        assert "references/" in result["error"]
+        on_disk = (isolate_skills / "big-skill" / "SKILL.md").read_text(encoding="utf-8")
+        assert on_disk == big
+
+    def test_patch_small_edit_allowed_on_big_skill(self, isolate_skills):
+        big = _content("big-skill-ok", 21_000)
+        json.loads(skill_manage(action="create", name="big-skill-ok", content=big))
+
+        result = json.loads(skill_manage(
+            action="patch", name="big-skill-ok",
+            old_string="# Test Skill\n\n", new_string="# Test Skill\n\n一句判据\n"))
+        assert result["success"] is True
+
+    def test_references_write_still_allowed_on_big_skill(self, isolate_skills):
+        big = _content("big-skill-refs", 21_000)
+        json.loads(skill_manage(action="create", name="big-skill-refs", content=big))
+
+        result = json.loads(skill_manage(
+            action="write_file", name="big-skill-refs", file_path="references/lesson.md",
+            file_content="# Lesson\n\n" + "detail " * 1_000))
+        assert result["success"] is True
+

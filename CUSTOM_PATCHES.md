@@ -1210,3 +1210,14 @@
 - **已验（2026-11-08 本机）**: ① 红 → 绿：基线（`git checkout HEAD -- tools/skill_manager_tool.py`，测试文件保留）**9 failed / 5 passed** ⇒ 补丁后 **14 passed**（`./venv/bin/python -m pytest tests/tools/test_skill_body_growth_guard.py`）；② 邻接 9 个 tools 测试文件 **159 passed / 3 failed**，三条失败在基线同一文件同样红（`TEST BUG: file I/O against the REAL hermes home`，`tests/home_io_guard.py` 环境红、非回归）；③ 生产真路径：对 `devops/test-gate-integrity/SKILL.md`（99,083 字符）实跑一次 `_patch_skill` 增长补丁 → 被拒（文案含 `references/`）且文件 sha256 未变。
 - **重放验证**: `verify_patches.sh` 的 `P33注入点1..3`（常量 / helper / `_guarded_write` 挂点）+ `P33契约`（回归用例文件在）。
 - **退役条件**: 上游在 SKILL.md 写入路径上自带「接近上限即拒增长」的等价闸（验收: `git diff <tag> -- tools/skill_manager_tool.py` 对本条为空，且上游对 `len(after) > len(before)` 的 SKILL.md 写入有 headroom 判据）；`pr_candidate=True`，但 C3 闸门核心补丁 33 / 阈值 15 ⇒ `PR_INTENT="blocked"`，不开 PR。
+
+### P34. 未知名 toolset 静默解析为空集 → 作业少整个工具面（cronjob create/update 无校验）— 2026-11-09 建立（待办 256820）
+
+- **文件**: `tools/cronjob_job_args.py`（新增 `_validate_toolsets()` + `import difflib`）；`tools/cronjob_tools.py`（create 校验链 + `_update_run_fields` 各挂一处）；测试: `tests/cron/test_cron_unknown_toolset_rejected.py`（新增 5 例）。
+- **现象（取证，2026-11-07~09）**: `~/.hermes/cron/jobs.json` 中 4 条作业带 `files`、1 条带 `feishu`。实测 `resolve_toolset('files') == []`、`('feishu') == []` —— **未知名静默解析为空集**，作业照跑、`last_status=ok`、无任何告警，只是那一侧工具面整体消失（含 enabled 的 `e8ddf7113e15` 周日 Step2 轮转）。`cronjob create/update` 与 `hermes cron edit` 全程不做名字校验。
+- **根因**: toolset 名解析是「查字典、查不到返回空表」，调用侧把空表当成「本作业不需要该工具」而非「名字写错」。与 `enabled_toolsets=[]` 的合法语义（显式零工具白名单）正面撞车 ⇒ 无法用「空即非法」兜底，只能校验名字本身。
+- **本次改动**: `_validate_toolsets(names)` —— 对每个名字调 `toolsets.validate_toolset()`（它认 `TOOLSETS` / 插件 toolset / registry alias，且不会因为 `context_engine`、`bot_room` 这类**合法但解析为空**的 toolset 误判）；未知则返回错误串，并用 `difflib.get_close_matches` 给出近似名（`files` → `file`，`feishu` → `feishu_doc`/`feishu_drive`）。`toolsets` 导入失败时 fail-open（不因目录不可用阻塞建单）。
+- **不变量**: `None`（无限制）与 `[]`（显式零工具白名单）**一律放行**，语义不变；`all`/`*` 放行；`enabled_toolsets` 传单个字符串时按单元素处理。
+- **已验（2026-11-09 本机）**: ① 校验器 12 条表驱动用例全 PASS（含 `[]`/`None`/`context_engine`/`*`/字符串形态/双错名）；② `tests/cron/test_cron_unknown_toolset_rejected.py` + `test_cron_explicit_empty_toolsets.py` **9 passed**（含「rejected create 不落盘」「rejected update 不改原值」）；③ 邻接 `tests/tools/test_cronjob_tools.py` **72 passed**（零回归）。
+- **重放验证**: `verify_patches.sh` 的 `P34注入点1..3`（`difflib` 导入 / `_validate_toolsets` 定义 / create 校验链挂点 / update 挂点）+ `P34契约`（回归用例文件在）。
+- **退役条件**: 上游在 cronjob create/update 对 `enabled_toolsets` 做名字校验（验收: `git diff <tag> -- tools/cronjob_tools.py` 对本条为空，且 `resolve_toolset` 未知名返回非空或调用侧报错）；`pr_candidate=True`，但 C3 闸门核心补丁 34 / 阈值 15 ⇒ `PR_INTENT="blocked"`，不开 PR。

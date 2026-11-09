@@ -2,6 +2,7 @@
 tools/cronjob_tools.py)."""
 
 import contextlib
+import difflib
 import logging
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Union
@@ -359,6 +360,40 @@ def _custom_stored_key_error(bu: str) -> Optional[str]:
     if any(_same_origin(bu, str(url)) for url in configured if url):
         return None
     return _base_url_refused(bu, "custom", custom_why)
+
+
+def _validate_toolsets(names: Optional[Any]) -> Optional[str]:
+    """Reject unknown `enabled_toolsets` names instead of silently resolving them to nothing.
+
+    `resolve_toolset('files')` returns [] — a near-miss name therefore strips a job's whole
+    tool face with no error and no log line, which is how a batch of jobs ran degraded for
+    weeks. Fail closed, and name the likely intended toolset.
+    """
+    if not names:
+        return None
+    if isinstance(names, (str, bytes)):
+        items = [names]
+    else:
+        try:
+            items = list(names)
+        except TypeError:
+            return (f"enabled_toolsets must be a list of toolset names; got {type(names).__name__}.")
+    try:
+        from toolsets import get_toolset_names, validate_toolset
+    except Exception:
+        return None  # catalog unavailable — never block job creation on it
+    unknown = [str(n) for n in items if not validate_toolset(str(n))]
+    if not unknown:
+        return None
+    known = get_toolset_names()
+    hints = []
+    for name in unknown:
+        close = difflib.get_close_matches(name, known, n=2, cutoff=0.6)
+        hints.append(f"'{name}'" + (f" (did you mean {', '.join(repr(c) for c in close)}?)"
+                                    if close else ""))
+    return ("Unknown enabled_toolsets " + ", ".join(hints)
+            + ". An unknown name resolves to zero tools and is silently ignored; "
+              "use exact names from the toolset catalog.")
 
 
 def _validate_cron_base_url(

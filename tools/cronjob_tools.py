@@ -63,7 +63,8 @@ from tools.cronjob_job_args import (
     _validate_bot_chat_deliver,
     _validate_context_from_refs,
     _validate_cron_base_url,
-    _validate_cron_script_path)
+    _validate_cron_script_path,
+    _validate_toolsets)
 from tools.registry import registry, tool_error
 
 
@@ -668,6 +669,8 @@ def _action_create(a: dict[str, Any]) -> str:
         # A model-supplied base_url must not route a named provider's stored credential
         # to an attacker endpoint.
         or _validate_cron_base_url(a["provider"], a["base_url"])
+        # Unknown toolset names resolve to zero tools silently — fail the create instead.
+        or _validate_toolsets(a["enabled_toolsets"])
         # bot-chat targets are machine-local: fail the CREATE, not the run.
         or _validate_bot_chat_deliver(deliver)
         # failure_deliver shares deliver's grammar and validators.
@@ -908,6 +911,9 @@ def _update_run_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[str
     """enabled_toolsets / attach_to_session / workdir / no_agent / repeat / schedule."""
     if a["enabled_toolsets"] is not None:
         # [] is an explicit zero-tool allowlist, not a clear back to the unrestricted default (#82010).
+        toolset_error = _validate_toolsets(a["enabled_toolsets"])
+        if toolset_error:
+            return toolset_error
         updates["enabled_toolsets"] = a["enabled_toolsets"]
     if a["attach_to_session"] is not None:
         updates["attach_to_session"] = bool(a["attach_to_session"])

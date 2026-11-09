@@ -427,8 +427,8 @@ mistral = ["mistralai==2.4.8"]
 # PM on first use; never a core dependency and deliberately
 # NOT in [all].
 otlp = [
-  "opentelemetry-sdk==1.39.1",
-  "opentelemetry-exporter-otlp-proto-http==1.39.1",
+  "opentelemetry-sdk==1.45.2",
+  "opentelemetry-exporter-otlp-proto-http==1.45.2",
 ]
 bedrock = ["boto3==1.42.89"]
 vertex = ["google-auth==2.55.1"]

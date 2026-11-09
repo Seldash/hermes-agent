@@ -79,6 +79,25 @@ _MODEL_USAGE_FIELDS = frozenset((
     "actual_cost_usd", "cost_status", "cost_source", "api_call_count"))
 
 
+def _normalize_billing_base_url(value: Optional[str]) -> Optional[str]:
+    """Collapse the one cosmetic difference that splits a billing endpoint into two rows.
+
+    An OpenAI/httpx client stringifies ``base_url`` with a trailing slash
+    (``https://host/v1/``) while the config string that produced it has none
+    (``https://host/v1``). ``session_model_usage`` keys on the exact string, so the
+    same account lands in two buckets and per-endpoint totals stop matching the
+    provider's own invoice. Keep one canonical form: no trailing slash, except for a
+    bare root (``https://host/`` → ``https://host``).
+    """
+    if not isinstance(value, str):
+        return value
+    text = value.strip()
+    if not text:
+        return text
+    stripped = text.rstrip("/")
+    return stripped or text
+
+
 class SessionUsageMixin:
     """Coalesced token writer, per-model usage rows, billing route."""
 
@@ -284,6 +303,7 @@ class SessionUsageMixin:
         for the row-existence guard; callers that don't know it leave the placeholder. ``task`` names a
         per-turn route (``voice_chat``): its calls count in the session totals and land in
         ``session_model_usage`` under that task, but never become the session's recorded route."""
+        billing_base_url = _normalize_billing_base_url(billing_base_url)
         usage = {k: v for k, v in locals().items() if k in _MODEL_USAGE_FIELDS}
         # Ensure the row exists: under concurrent load create_session() may have failed on
         # locking, and the UPDATE would silently affect 0 rows. When this guard is the first
@@ -362,7 +382,7 @@ class SessionUsageMixin:
         conn.execute(_MODEL_USAGE_UPSERT_SQL, (
             session_id, model or sess.get("model") or "unknown",
             billing_provider or sess.get("billing_provider") or "",
-            billing_base_url or sess.get("billing_base_url") or "",
+            _normalize_billing_base_url(billing_base_url or sess.get("billing_base_url") or ""),
             billing_mode or sess.get("billing_mode") or "", task or "", api_call_count or 0, *counts,
             float(estimated_cost_usd or 0.0), float(actual_cost_usd or 0.0), cost_status, cost_source, now, now))
 
@@ -381,6 +401,7 @@ class SessionUsageMixin:
         Background-review forks record an aggregate of N fork API calls in one write with
         ``task='background_review'`` (issue #87250).
         """
+        billing_base_url = _normalize_billing_base_url(billing_base_url)
         usage = {k: v for k, v in locals().items() if k in _MODEL_USAGE_FIELDS}
         if not session_id or not task:
             return

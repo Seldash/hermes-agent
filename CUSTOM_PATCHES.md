@@ -1145,6 +1145,13 @@
 - **重放验证**: `verify_patches.sh` 的 `P27注入点`（4 条 pin 同时在位）。
 - **退役条件**: 上游把 4 个 pin 抬到 ≥ 本仓运行时版本后 drop（验收: `git diff <tag> -- pyproject.toml` 对本条为空）；`pr_candidate=True`，受 C3 闸门冻结先本地 carry。
 
+#### P27 修订（2026-11-09，wj 265353）：otlp extra 的两条 pin 一并纳入对齐面
+
+- **改动**: `pyproject.toml` 的 `otlp` extra 两条 pin `1.39.1 → 1.45.2`（`opentelemetry-sdk` / `opentelemetry-exporter-otlp-proto-http`）。同属「pin 与实装版本脱钩」这一类，机制与 P27 正文一致，故并入本补丁而不另立号。
+- **触发**: 实装已是 1.45.2（`pip list` 实测），pin 停在 1.39.1 ⇒ `pm.ensure_import('otlp')` 与 `pip install -e .` 都会把 otel 静默降回 1.39.1；`pip check` 当时无报错（otel 不在包元数据依赖面），属静默型不一致。
+- **验证**: `venv/bin/python -m pip check` 无输出；`import opentelemetry.sdk` + `opentelemetry.exporter.otlp.proto.http` 通过；仓库内无 `1.39.1` 残留引用（除 node_modules）。上游 `origin/main` 当前为 1.45.1，本仓领先 1 个 patch 版本，退役条件同上（上游 ≥ 1.45.2）。
+- **重放验证**: `verify_patches.sh` 的 `P27注入点5`（otlp 两条 pin）。
+
 ### P30. 同一会话一个选择题显示两次（待答卡按会话取值、缺行归属）— 2026-11-06 建立
 
 - **文件**: `apps/desktop/src/components/assistant-ui/clarify/index.tsx`（行归属 `rowKeyByRequestId` + `argsMatchQuestions` + 抑制计数 `suppressedClarifyRowCount` / `resetClarifyCardBindingsForTests`）、`apps/desktop/src/lib/chat-messages/tool-parts.ts`（`findPendingClarifyLocation` 的 sole-open 兜底加「目标行自身无匹配值」前置）；测试: `apps/desktop/src/components/assistant-ui/clarify/clarify-duplicate-card.test.tsx`（新增 3 例）、`apps/desktop/src/app/session/hooks/use-message-stream/clarify-hydration.test.tsx`（+1 例）。

@@ -32,6 +32,20 @@ _SNAPSHOT_EXCLUDED_ENV_REGEX = (
     "HERMES_RPC_|HERMES_KERNEL_DIR)")
 _SHELL_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
+# Credential-shaped env names are NEVER persisted into the shared bash snapshot. The snapshot is a
+# file on disk (``HERMES_HOME/cache/scratch/hermes-snap-*.sh``) that every later command ``source``s,
+# and one long-lived backend serves many sessions — under a multiplexed gateway, many profiles. A
+# provider/tool key dumped there is therefore a live secret sitting in a cache file (and, across
+# profiles, one profile's key being re-exported into another's shell). The value is re-injected
+# fresh onto every command's process env by the spawn layer (Popen env locally, ``docker exec -e`` /
+# SSH exec env remotely), so dropping it from the snapshot loses no functionality — commands that
+# need the key still see it. Name-shaped on purpose: an operator's own ``export FOO_API_KEY=…`` in a
+# previous command is caught too, no allowlist to keep in sync.
+_SNAPSHOT_SECRET_NAME_PATTERN = (
+    "(_API_KEY|_APIKEY|_TOKEN|_SECRET|_SECRET_KEY|_PASSWORD|_PASSWD|_ACCESS_KEY"
+    "|_ACCESS_KEY_ID|_PRIVATE_KEY|_SIGNING_KEY|_CLIENT_SECRET|_CREDENTIALS)$")
+_SNAPSHOT_SECRET_NAME_RE = re.compile(_SNAPSHOT_SECRET_NAME_PATTERN, re.IGNORECASE)
+
 # mktemp template suffix + the shell variable holding the allocated temp path.
 _SNAP_TMP_SUFFIX = ".tmp.XXXXXXXXXX"
 _SNAP_TMP = '"$__hermes_snap_tmp"'
@@ -66,6 +80,14 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
     # become shell syntax (valid names stay unquoted by shlex.quote()).
     safe_names = {name for name in excluded_names if isinstance(name, str) and name}
     extra_unset = "".join(f" {shlex.quote(name)}" for name in sorted(safe_names))
+    # Name-shaped sweep (see ``_SNAPSHOT_SECRET_NAME_RE``): drops credentials that entered the shell
+    # from anywhere — a provider rc file, an earlier command's ``export`` — instead of relying on the
+    # Python side knowing the name. ``compgen -v`` lists variable names only (no values), so the
+    # values never travel through this snippet. ``unset`` of a readonly name fails silently, which is
+    # fine: a readonly var cannot be sourced from the snapshot either.
+    secret_sweep = (
+        "for __hermes_secret in $(compgen -v 2>/dev/null | grep -Eiu "
+        f"'{_SNAPSHOT_SECRET_NAME_PATTERN}') ; do unset \"$__hermes_secret\" 2>/dev/null; done; ")
     return (
         "{ ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
         "${!HERMES_BROWSER_CONTROL_*} "
@@ -82,12 +104,14 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
         # on the backend and outlive the private dir it protects.
         "${!HERMES_RPC_*} HERMES_KERNEL_DIR "
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
+        f"{secret_sweep}"
         "export -p; ) || true; } "
         f"> {tmp_path}")
 
 
 def _snapshot_bootstrap_script(
-    *, quoted_cwd: str, quoted_snap: str, snap_tmp_template: str, excluded_names: Iterable[str], cwd_marker: str,
+    *, quoted_cwd: str, quoted_snap: str, snap_tmp_template: str, excluded_names: Iterable[str],
+    cwd_marker: str, secret_names: Iterable[str] = (),
 ) -> str:
     """Login-shell bootstrap that captures env/functions/aliases into the snapshot. Atomic publish:
     assemble in a ``mktemp`` file, then ``mv`` over the final path so a concurrent ``source`` never
@@ -100,7 +124,7 @@ def _snapshot_bootstrap_script(
     return (
         "umask 077\n"
         f"__hermes_snap_tmp=$(mktemp {snap_tmp_template}) || exit 1\n"
-        f"{_export_dump_excluding_session_vars(_SNAP_TMP, excluded_names)}\n"
+        f"{_export_dump_excluding_session_vars(_SNAP_TMP, (*excluded_names, *secret_names))}\n"
         "__hermes_fns=$(declare -F | awk '{print $3}' | grep -vE '^_[^_]') || true\n"
         f"[ -n \"$__hermes_fns\" ] && declare -f $__hermes_fns >> {_SNAP_TMP} 2>/dev/null || true\n"
         f"alias -p >> {_SNAP_TMP}\n"
@@ -132,7 +156,7 @@ def _passthrough_save_restore(names: Iterable[str]) -> tuple[list[str], list[str
 def _wrap_command_script(
     command: str, *, quoted_cwd: str, quoted_snap: str, snap_tmp_template: str,
     passthrough_names: Iterable[str], snapshot_ready: bool, cwd_marker: str,
-    persist_env: bool = True) -> str:
+    persist_env: bool = True, secret_names: Iterable[str] = ()) -> str:
     """Per-command bash script: source snapshot, cd, run, re-dump env, emit CWD marker.
     ``persist_env=False`` skips the re-dump, so every command starts from the login-time
     snapshot and exports from one command never reach the next (the CWD marker still runs).
@@ -143,10 +167,14 @@ def _wrap_command_script(
     uses the same mktemp+mv atomic publish as the bootstrap and chains ``mv`` on the dump
     succeeding so a failed dump never replaces a good snapshot. ``umask 077`` is applied after
     the user's command so snapshot files (which may carry secrets) are private without
-    changing the command's umask.
+    changing the command's umask. ``secret_names`` are credential-shaped names from the spawn
+    env: they are saved/restored around ``source`` (so a snapshot written before this exclusion
+    existed — or by another profile — can never re-export a stale key over the fresh per-command
+    value) and excluded from the re-dump.
     """
     escaped = command.replace("'", "'\\''")
-    save, restore = _passthrough_save_restore(passthrough_names)
+    excluded = tuple(dict.fromkeys([*passthrough_names, *secret_names]))
+    save, restore = _passthrough_save_restore(excluded)
     parts = list(save)
     if snapshot_ready:
         parts.append(f"source {quoted_snap} >/dev/null 2>&1 || true")
@@ -162,7 +190,7 @@ def _wrap_command_script(
     if snapshot_ready and persist_env:
         parts.append(
             f"__hermes_snap_tmp=$(mktemp {snap_tmp_template}) && "
-            f"{{ {_export_dump_excluding_session_vars(_SNAP_TMP, passthrough_names)} "
+            f"{{ {_export_dump_excluding_session_vars(_SNAP_TMP, excluded)} "
             f"&& mv -f {_SNAP_TMP} {quoted_snap}; }} "
             f"2>/dev/null || rm -f {_SNAP_TMP} 2>/dev/null || true")
     parts += [_cwd_marker_printf(cwd_marker), "exit $__hermes_ec"]

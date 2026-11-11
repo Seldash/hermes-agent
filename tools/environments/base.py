@@ -351,6 +351,24 @@ class BaseEnvironment(ABC):
             logger.debug("Could not refresh profile-scoped snapshot exclusions", exc_info=True)
         return tuple(sorted(self._snapshot_passthrough_names))
 
+    def _snapshot_secret_names(self) -> tuple[str, ...]:
+        """Credential-shaped names in this environment's spawn env.
+
+        Excluded from the snapshot at both dump sites (see ``_SNAPSHOT_SECRET_NAME_RE``): the
+        snapshot is a cache file that every later command ``source``s — and, on a backend shared by
+        several sessions/profiles, a file one of them can read back. Every one of these values is
+        re-injected per command by the spawn layer, so the exclusions cost no functionality. Purely
+        name-shaped (no value inspection, no allowlist): whatever key the operator added to ``.env``
+        or exported is covered without touching this file.
+        """
+        from tools.environments.base_session_env import _SNAPSHOT_SECRET_NAME_RE
+
+        merged = dict(os.environ | self.env)
+        return tuple(sorted(
+            name for name in merged
+            if isinstance(name, str) and _SHELL_ENV_NAME_RE.fullmatch(name)
+            and _SNAPSHOT_SECRET_NAME_RE.search(name)))
+
     def _snapshot_script_kwargs(self, cwd: str) -> dict:
         """Quoting inputs shared by the bootstrap and per-command wrapper scripts.
         ``_quote_cwd_for_cd`` / ``_quote_shell_path`` (not bare shlex.quote) let the Windows
@@ -359,6 +377,7 @@ class BaseEnvironment(ABC):
             quoted_cwd=self._quote_cwd_for_cd(cwd),
             quoted_snap=self._quote_shell_path(self._snapshot_path),
             snap_tmp_template=self._quote_shell_path(self._snapshot_path + _SNAP_TMP_SUFFIX),
+            secret_names=self._snapshot_secret_names(),
             cwd_marker=self._cwd_marker)
 
     def init_session(self):

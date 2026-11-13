@@ -141,6 +141,22 @@
   回滚：`cp -a ~/.hermes/data/script_baselines_pre_change/jobs.py.pre-o3align-* ~/.hermes/hermes-agent/cron/jobs.py`
   （脚本侧 4 文件同名 pre-image 在 `~/.hermes/data/script_baselines_pre_change/`）。
 
+#### P4 修订（2026-11-13，wj 284058）：满额拒绝时给「可停用候选」
+
+- **动因**：满额（近 30 天在役增量 ≥30）时 `create_job` 的拒绝信息只有「合并/复用或停用/删除配平」——
+  人要自己翻三十条记录找谁腾位置，最常见的实际动作反而变成设 `HERMES_CRON_BUDGET_BYPASS=1` 绕过闸门。
+- **语义**：拒绝前从**计入额度的在役增量**里挑最多 3 条候选，判据 ①近 30 天零跑次（建档 ≥3 天从未跑过，
+  或末次跑次早于 30 天）②连续 ≥7 次告警/失败；按读数降序排列。提示只给 `hermes cron pause <id>`
+  （停用即不再计入在役增量、可随时 resume），**不引导删除**（防线该停不该删）。
+- **边界**：`next_run_at` 仍在未来的一次性/待跑任务不点名（没跑过是设计如此，不是零产出）；
+  候选为空时只保留原提示。时间戳解析失败一律跳过（候选是建议面，不得因脏值抛错）。
+- **实现面 3 处**：`cron/jobs.py`（`_BUDGET_CANDIDATE_LIMIT`(3) / `_BUDGET_ALERT_STREAK`(7) /
+  `_BUDGET_NEVER_RUN_GRACE_DAYS`(3) + `_budget_stop_candidates()` + 拒绝信息尾段）+
+  `verify_patches.sh` P4 新增 2 项断言 + 本文件。阈值、计数口径、拦截点（仅 create 路径）均不变。
+- **不新开号的理由**：同一函数、同一触发点、只改拒绝信息（不新增闸门/开关）；另开号只会把
+  `patch_manifest.py budget` 的核心补丁数继续推高（已 37/15），把真正该看的「净增」读数淹没。
+- **回滚**：删掉候选函数调用与尾段即可回到原提示，不涉及阈值与计数口径。
+
 ### P5. Feishu fake-alive 守卫：等待 SDK 真实握手 + start() 异常可见 — 2026-09-03 建立
 
 - **文件**: `plugins/platforms/feishu/adapter.py`（`_run_official_feishu_ws_client` / `_connect_with_overrides` / `_connect_websocket` / `connect()` / `__init__`）

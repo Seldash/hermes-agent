@@ -1827,9 +1827,14 @@ def _next_run_or_reject_past_oneshot(
 # cron_governance_weekly / architecture_compliance_check 均 import 它）+ 上述两处消费端；
 # 阈值与口径断言见 scripts/verify_patches.sh 的 P4 段与 scripts/patch_manifest.py 的 P4 项。
 _CRON_GROWTH_LIMIT_DEFAULT = 30
+# 满额拒绝时的「可停用候选」口径（2026-11-13 待办 284058 ②）：原提示只说「合并/复用或停用/删除配平」，
+# 满额时人要自己翻三十条记录找谁腾位置，最常见的动作反而成了 HERMES_CRON_BUDGET_BYPASS=1 绕过闸门。
+_BUDGET_CANDIDATE_LIMIT = 3       # 最多点名 3 条，避免拒绝信息本身变成一屏噪声
+_BUDGET_ALERT_STREAK = 7          # 连续 7 次告警/失败 = 稳定无产出的防线
+_BUDGET_NEVER_RUN_GRACE_DAYS = 3  # 建档 3 天仍未跑过才算「零跑次」（刚建的任务不该被点名）
 
 
-def is_active_increment(job: Dict[str, Any]) -> bool:
+def is_active_increment(job: dict[str, Any]) -> bool:
     """近 30 天「在役增量」判定（口径分层 2026-09-25 待办 461346；在役对齐 2026-10-16）。
 
     在役 = 仍占用调度资源 = is_job_runnable()（enabled 且无暂停标记），**常驻与一次性同一判定**：
@@ -1841,6 +1846,70 @@ def is_active_increment(job: Dict[str, Any]) -> bool:
     ``scripts/tests/test_cron_budget_scope.py`` 的契约测试守住（同一数据必须同计数）。
     """
     return is_job_runnable(job)
+
+
+def _parse_job_ts(value: Any) -> Optional[datetime]:
+    """解析任务记录里的 ISO 时间戳；不可解析一律 None（候选挑选是**建议**面，不得因脏值抛错）。"""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _days_since(now: datetime, ts: datetime) -> int:
+    """按 ts 自带时区折算天数（jobs.json 里是 +08:00，直接相减会 TypeError）。"""
+    if ts.tzinfo is not None:
+        now = now.astimezone(ts.tzinfo)
+    return (now - ts).days
+
+
+def _budget_stop_candidates(
+    active_jobs: list[dict[str, Any]],
+    limit: int = _BUDGET_CANDIDATE_LIMIT,
+) -> list[str]:
+    """从「计入额度的在役增量」里挑最该停用的几条（纯函数、只读）。
+
+    口径（2026-11-13 待办 284058 ②）：①近 30 天零跑次（建档多日从未跑过，或末次跑次早于 30 天）；
+    ②连续 ≥7 次告警/失败。只建议**停用**不删记录 —— 停用即不再计入在役增量，额度立刻腾出，
+    且随时 resume；建议删除会把「防线该停不该删」逼回删除路径。
+    """
+    now = datetime.now()
+    scored: list[tuple[int, str]] = []
+    for job in active_jobs:
+        jid = str(job.get("id") or "?")
+        name = str(job.get("name") or jid)
+        status = str(job.get("last_status") or "").lower()
+        try:
+            streak = int(job.get("failure_streak") or 0)
+        except (TypeError, ValueError):
+            streak = 0
+        last = _parse_job_ts(job.get("last_run_at"))
+        created = _parse_job_ts(job.get("created_at"))
+        if last is None:
+            # 一次性/尚未到点的任务「没跑过」是设计如此，不是零产出：next_run 还在未来就跳过
+            nxt = _parse_job_ts(job.get("next_run_at"))
+            if nxt is not None:
+                if nxt.tzinfo is not None:
+                    nxt = nxt.astimezone()
+                if nxt > now.astimezone():
+                    continue
+            if created is not None:
+                idle_days = _days_since(now, created)
+                if idle_days >= _BUDGET_NEVER_RUN_GRACE_DAYS:
+                    scored.append((idle_days, f"[{jid}] {name} —— 建档 {idle_days} 天从未跑过"))
+            continue
+        idle_days = _days_since(now, last)
+        if idle_days >= 30:
+            scored.append((idle_days,
+                           f"[{jid}] {name} —— 近 30 天零跑次（末次 {last.date().isoformat()}）"))
+        elif streak >= _BUDGET_ALERT_STREAK:
+            scored.append((streak,
+                           f"[{jid}] {name} —— 连续 {streak} 次告警/失败（末次状态 {status or '?'}）"))
+    scored.sort(key=lambda item: -item[0])
+    return [line for _, line in scored[:limit]]
 
 
 def _check_job_growth_budget(label: str) -> None:
@@ -1875,12 +1944,21 @@ def _check_job_growth_budget(label: str) -> None:
             f"{j.get('created_at', '')[:10]} {j.get('name', '?')}"
             for j in sorted(new_jobs, key=lambda x: x.get("created_at", ""))[-8:]
         )
+        candidates = _budget_stop_candidates(new_jobs)
+        cand_block = ""
+        if candidates:
+            cand_block = (
+                "\n可停用候选（停用即腾出名额、可随时 resume；不必删除记录）:\n"
+                + "\n".join(f"  {i}. {line}" for i, line in enumerate(candidates, 1))
+                + "\n  CMD: hermes cron pause <job_id>"
+            )
         raise ValueError(
             f"cron 增量拦截: 近30天在役增量 {len(new_jobs)} 个(上限 {limit}，"
             f"口径=在役（enabled 且未暂停）；停用常驻与已跑完/已禁用的一次性不计)，"
             f"拒绝创建「{label}」。新增前先评估合并/复用现有任务，或停用/删除不再需要的任务配平；"
             f"紧急场景可设 HERMES_CRON_BUDGET_BYPASS=1 跳过本拦截。"
             f"在役增量示例: {recent}"
+            f"{cand_block}"
         )
 
 
@@ -2492,7 +2570,6 @@ def _record_run_outcome(
     job.pop("manual_run_at", None)
     # The transient manual-run context is single-fire: the run that just completed consumed it.
     job.pop("manual_run_prompt", None)
-    delivery_failed = isinstance(delivery_error, str) and bool(delivery_error.strip())
     job["last_status"] = status or _derived_last_status(success, error, delivery_error)
     job["last_error"] = None if success else error
     if success:

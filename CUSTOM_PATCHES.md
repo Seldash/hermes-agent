@@ -1298,3 +1298,4 @@
 - **为何放最外层**：Starlette onion 后加先跑；压缩需看到最终 body。`GZipMiddleware` 自身跳过 `text/event-stream` 与 `http.response.pathsend`，PTY/SSE 与 `FileResponse` 不受影响；`Cache-Control: immutable` 原样透传。
 - **回滚**：删掉这两行 import + add_middleware 即恢复；备份见 `data/backups/20261115051459/web_server.py`。
 - **不变量**：另有一处 a11y 修补在 `web/src/components/ProfileSwitcher.tsx`（给 `@nous-research/ui` 的 combobox trigger 补 `aria-label`），前端文件不入补丁清单，随 dist 重建生效。
+- **门禁脚本（2026-11-15 补登）**：`scripts/qa/` 四个文件随本补丁入树——`axe_scan.py`（违规+24×24 硬判定）、`interaction_probe.py`（LCP/CLS/INP）、`budget_check.sh`（体积预算）、`spacing_probe.py`（SC 2.5.8 间距例外测量，补 axe_scan 只做硬判定的缺口）。`spacing_probe.py` 带视口过滤：移动端关闭态抽屉 transform 到 x=-240，其按钮 rect 仍在 DOM，不过滤会算出 `d=0` 相交假违规（实测 3 条）。

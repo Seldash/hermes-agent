@@ -293,6 +293,27 @@ for _k31_provider in ("kimi-coding-cn", "moonshot", "moonshot-cn"):
     )
 del _k31_provider
 
+# Alibaba Model Studio (DashScope) Qwen：静态快照里此前没有任何 alibaba 条目 →
+# 审计/兜底路由的每一次调用都落 cost_status=unknown、estimated_cost_usd=0（成本不可见）。
+# 价格取 scripts/cost_tracker_pricing.py 的**折后实付价**（阿里云 BSS 逐计费项
+# AfterDiscountAmount ÷ Usage 反推，元/百万 token），按 ¥7.15/$ 折算为 USD per 1M。
+#   qwen3.7-plus  ¥1.6 / 6.4 / 0.16 / 2.0     （原价 2/8 限时 8 折）
+#   qwen3.8-flash ¥0.8 / 2.7 / 0.1  / 1.25    （BSS 实读，缓存三档非通用比例）
+# provider 别名各登一行：DashScope 兼容口的会话可能记成 alibaba / alibaba-cn / dashscope
+# 任一种（配置名与 base_url 派生名并存），漏一个就仍是 $0。
+for _qwen_provider in ("alibaba", "alibaba-cn", "dashscope"):
+    _OFFICIAL_DOCS_PRICING[(_qwen_provider, "qwen3.7-plus")] = _snap(
+        "0.2238", "0.8951", "0.0224", "0.2797",
+        url="https://help.aliyun.com/zh/model-studio/models",
+        version="alibaba-qwen3.7-plus-2026-11",
+    )
+    _OFFICIAL_DOCS_PRICING[(_qwen_provider, "qwen3.8-flash")] = _snap(
+        "0.1119", "0.3776", "0.0140", "0.1748",
+        url="https://help.aliyun.com/zh/model-studio/models",
+        version="alibaba-qwen3.8-flash-2026-11",
+    )
+del _qwen_provider
+
 # GPT-6 Astra uses whole-request pricing above the 272K prompt tier.  Keep this
 # account-gated model out of generic static catalogs, but retain published billing
 # metadata for an explicitly selected route.

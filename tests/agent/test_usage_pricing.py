@@ -924,3 +924,17 @@ def test_anthropic_fast_response_without_a_fast_rate_is_unknown():
     result = estimate_usage_cost("claude-sonnet-4-6", _anthropic_usage("fast"), provider="anthropic")
     assert result.amount_usd is None
     assert result.status == "unknown"
+
+
+def test_alibaba_qwen_models_are_priced_under_every_dashscope_provider_alias():
+    """DashScope 兼容口记的 provider 名有 alibaba / alibaba-cn / dashscope 三种写法；
+    任一种缺登记都会让用量落 cost_status=unknown、estimated_cost_usd=0（成本不可见）。"""
+    usage = CanonicalUsage(input_tokens=1_000_000)
+    for provider in ("alibaba", "alibaba-cn", "dashscope"):
+        for model, input_rate in (("qwen3.7-plus", Decimal("0.2238")), ("qwen3.8-flash", Decimal("0.1119"))):
+            entry = get_pricing_entry(model, provider=provider)
+            assert entry is not None and entry.source == "official_docs_snapshot", (provider, model)
+            assert entry.input_cost_per_million == input_rate, (provider, model)
+            result = estimate_usage_cost(model, usage, provider=provider)
+            assert result.status == "estimated", (provider, model)
+            assert result.amount_usd == input_rate, (provider, model)

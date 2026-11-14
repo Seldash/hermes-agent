@@ -1134,6 +1134,18 @@
 - **重放验证**: 新增 `P25K3.1价格`（登记行 + 快照版本同时存在）。
 - **已知生效滞后**: 本补丁在 `~/.hermes/hermes-agent` 树内，**live 运行树 `~/.hermes/installs/<id>/environments/<id>/workspace` 仍是旧版（10-19 构建，早于 P25）** → 在下次 install 重建/升级前，K3.1 Pro 的运行期 `cost_status` 仍为 unknown；报表口径走 `cost_tracker_pricing.py`（已即时生效），不受此滞后影响。
 
+#### 2026-11-15 扩展：Alibaba（DashScope）Qwen 同批登记（同一补丁，不新建 P 号）
+
+- **触发**: 审计 profile 主模型 `qwen3.7-plus` / provider `alibaba` 在 `_OFFICIAL_DOCS_PRICING` 里**一条都没有** → `estimate_usage_cost` 返回 `status=unknown / amount=None`。实测 `profiles/auditor/state.db` 的 `session_model_usage`：97 行、2275 次调用、1.45M 缓存读 token，`estimated_cost_usd` 全 0.0；default 的兜底 `qwen3.8-flash`（21 行）同样为 0。
+- **本次改动**: `del _k31_provider` 之后新增循环，对 `alibaba` / `alibaba-cn` / `dashscope` 三个 provider 写法各登记 `qwen3.7-plus`（`0.2238 / 0.8951 / 0.0224 / 0.2797` USD per 1M）与 `qwen3.8-flash`（`0.1119 / 0.3776 / 0.0140 / 0.1748`），`version=alibaba-qwen*-2026-11`。价格 = `scripts/cost_tracker_pricing.py` 的**折后实付价**（阿里云 BSS `AfterDiscountAmount ÷ Usage` 反推，元/百万 token：`qwen3.7-plus` 1.6/6.4/0.16/2.0；`qwen3.8-flash` 0.8/2.7/0.1/1.25）按 **¥7.15/$** 折算（与 P25 K3 段同一汇率口径）。
+- **不变量**: 只新增价格条目；不改 `resolve_billing_route` 的 provider 别名映射（故 `billing_mode` 仍记 `unknown`，与既有 alibaba 行为一致）、不改 `estimate_usage_cost`、不动环境变量。
+- **仍留 unknown 的 Qwen 型号（有意）**: `qwen3-max` / `qwen3-vl-plus` / `qwen3.6-flash` / `qwen3.7-flash` / `qwen3.7-max` / `qwen3.8-max[-0902]` —— 两处价表的缓存三档对它们均标「未校准/占位」，登记进 core 等于把假精度写进账本。要清这一片，先补 BSS 缓存计费项实证。
+- **已验红绿（2026-11-15，`scripts/run_tests.sh tests/agent/test_usage_pricing.py`，venv python 3.12.13）**: 红线 = HEAD 源码 + 新用例 → `1 failed`（`assert None is not None`，`get_pricing_entry` 返回 None）；补丁后同文件 `60 passed`。行为面：`estimate_usage_cost('qwen3.7-plus', 真实 auditor 行 180/16595/1447933/131828, provider='alibaba')` → `status=estimated`、`amount_usd=0.0842`、`pricing_version=alibaba-qwen3.7-plus-2026-11`；三个 provider 写法同值；`has_known_pricing` 由 False 转 True。
+- **重放验证**: 新增 `P25Alibaba价格`（三条注入点：条目行 + 两条快照版本）。
+- **生效条件**: 运行期价格在**网关/会话进程导入时**读入 → 已连的进程仍持旧模块，需下次网关重启或新进程起效；报表口径（`cost_tracker_pricing.py`）本就登记过，不受此约束。
+- **退役条件**: 与 P25 同——上游自带 alibaba qwen 条目后整条 drop。
+
+
 ### P26. 桌面端 GPU 兜底两条自旋盲区（占位版本锁死 SwiftShader + GPU 子进程存活≠健康）— 2026-10-23 建立（待办 398478）
 
 - **文件**:

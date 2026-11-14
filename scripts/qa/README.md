@@ -34,3 +34,21 @@ python3 scripts/qa/spacing_probe.py http://127.0.0.1:8124/models --viewport 390x
 必带视口过滤：移动端关闭态抽屉用 transform 平移到 x=-240，其按钮 rect 仍在 DOM 里，
 不过滤会算出 `d=0` 相交假违规（实测 3 条）。同时按视口宽度分别测——1280 宽度下
 顶栏品牌区（HERMES TEAL / EN）与 DOCUMENTATION 只距 4.6/5.8px，是真违规，390 宽度不出现。
+
+## a11y 门禁的两个「态」必须显式声明
+
+同一个 dashboard 在**空态**（全新 HERMES_HOME，首启横幅 + 空列表）与**常规态**（已有 profile/会话）下，axe 的违规集合并不相同 —— 所以 `axe_scan.py --state {empty,configured}` 是**必填**参数，不声明态就不给结论（旧的无参调用会直接 argparse 报错，这是故意的）。`--verify-state` 会反查页面确实处于声明的态（例如空态必须看到首启横幅、常规态必须看到会话列表），对不上即 `state_verified != ok` 并 exit 1，防止「拿空态读数冒充常规态」。
+
+验收口径：两态各跑一次 `--undersized report --verify-state` 都要 `critical_serious=0`、`state_verified=ok`。
+
+## known-upstream 白名单（fail closed）
+
+`a11y-whitelist.json` 只登记**三级依赖内的上游缺陷**，一条命中需五个条件同时成立：
+
+1. 规则 id 一致；2. 该违规的**全部**节点都命中 `selector`（部分命中不豁免）；3. 当前态在 `states` 里；4. `recheck_by` 未过期；5. 自动探测到的 `@nous-research/ui` 版本等于 `upstream.version`（`--ui-version` 可显式覆盖）。
+
+任一不成立都按原样报红 —— 过期（`expired`）与版本漂移（`version_mismatch`）都会让门禁 exit 1，提醒重新评估上游是否已修。当前仅一条：`stats.js:24` 硬编码 `opacity-20` 的装饰点线（1.73:1），复查日 2027-02-15。
+
+## 24×24 判罚分工：axe 报、spacing_probe 判
+
+`--undersized {fail,report,ignore}` 默认仍是 `fail`（不放宽旧行为）。门禁脚本显式传 `report`：undersized 照旧打印但不影响退出码，**SC 2.5.8 的间距例外由 `spacing_probe.py` 判**（可见且不满足例外的才 VIOLATION）。也就是说这两条不是二选一，`gate:a11y:both` 会把两态 axe + 间距一起跑。

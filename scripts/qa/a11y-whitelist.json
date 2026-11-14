@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "note": "known-upstream 豁免表。命中需同时满足：规则 id、该违规全部节点命中 selector、态在 states 内、未过 recheck_by、上游包版本与 upstream.version 一致。任一不成立按原样报红（fail closed）。复查日期到期后本项自动失效并报红，提醒重新评估上游补丁。",
+  "entries": [
+    {
+      "rule": "color-contrast",
+      "selector": "tracking-[0.4em].opacity-20",
+      "impact": "serious",
+      "states": ["empty", "configured"],
+      "upstream": {
+        "package": "@nous-research/ui",
+        "version": "0.18.2",
+        "file": "dist/ui/components/stats.js:24",
+        "note": "Stats 组件中间列的点线分隔符（····），纯装饰引导线，无文本语义；className 里硬编码 text-[13px] tracking-[0.4em] opacity-20，调用侧拿不到 className 入口"
+      },
+      "reason": "实测对比度 1.73:1（color(srgb 1 0.901961 0.796078) × opacity 0.2 on rgb(4,28,28)）。装饰性内容，但 axe 不因「无语义」跳过 color-contrast；两态各 2 节点（390×844）/ 4 节点（1280×800），与 provider 配置无关。上游修好后本项应删除。",
+      "recheck_by": "2027-02-15",
+      "tracking": "782341"
+    }
+  ]
+}

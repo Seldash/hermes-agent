@@ -12,7 +12,11 @@
     "preview": "vite preview",
     "typecheck": "tsc -b . --noEmit",
     "test": "vitest run",
-    "check": "npm run typecheck && npm run test && npm run lint"
+    "check": "npm run typecheck && npm run test && npm run lint",
+    "gate:a11y": "python3 ../scripts/qa/axe_scan.py ${GATE_URL:-http://127.0.0.1:8123/models} --state configured --undersized report --verify-state",
+    "gate:a11y:empty": "python3 ../scripts/qa/axe_scan.py ${GATE_URL:-http://127.0.0.1:8123/models} --state empty --undersized report --verify-state",
+    "gate:spacing": "python3 ../scripts/qa/spacing_probe.py ${GATE_URL:-http://127.0.0.1:8123/models} --viewport 390x844",
+    "gate:a11y:both": "npm run gate:a11y && npm run gate:a11y:empty && npm run gate:spacing"
   },
   "dependencies": {
     "@hermes/shared": "file:../apps/shared",

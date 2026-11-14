@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { Users } from "lucide-react";
 import {
   Select,
@@ -28,14 +28,27 @@ export function ProfileSwitcher({ collapsed }: ProfileSwitcherProps) {
     [currentProfile, t.app.currentProfileOption],
   );
 
-  if (profiles.length < 2) return null;
-
   const managed = profile || currentProfile || "default";
   const isOther = !!profile && profile !== currentProfile;
   const managingLabel = t.app.managingProfile ?? "Managing profile";
+  const containerRef = useRef<HTMLDivElement | null>(null);
+
+  // @nous-research/ui's Select puts role="combobox" on its trigger button, and
+  // ARIA only takes an author-supplied name for that role (the visible text is
+  // not an accessible name), while the component exposes no label prop. Set it
+  // on the trigger directly; drop this once the package accepts aria-label.
+  useEffect(() => {
+    const trigger = containerRef.current?.querySelector<HTMLButtonElement>(
+      'button[role="combobox"]',
+    );
+    trigger?.setAttribute("aria-label", managingLabel);
+  }, [managingLabel, managed, collapsed]);
+
+  if (profiles.length < 2) return null;
 
   return (
     <div
+      ref={containerRef}
       className={cn(
         "flex items-center gap-2 border-b border-current/10 px-3 py-2",
         collapsed && "lg:justify-center lg:px-0",

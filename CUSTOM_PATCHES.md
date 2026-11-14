@@ -1277,3 +1277,12 @@
 - **生效面**: 代码改动**需网关重启才生效**（tier1，另行排期）。重启前活着的 gateway 仍按旧代码每条命令写回快照 ⇒ 本条的「扫描面 0 命中」在重启后才成立，重启窗口另行登记。
 - **重放验证**: `verify_patches.sh` 的 `P37注入点1..4`（名形模式常量 / dump 内 `compgen` 扫描 / `_snapshot_secret_names` 方法 / wrapper 的 `secret_names` 参数与 re-dump 排除）+ `P37契约`（`test_snapshot_secret_exclusion.py` 在）。
 - **退役条件**: 上游快照 dump 自带等价的名形凭据排除（验收: `git diff <tag> -- tools/environments/base_session_env.py tools/environments/base.py` 对本条为空，且上游 dump 路径同样在 `export -p` 前 unset 凭据名）；`pr_candidate=True`，但 C3 闸门核心补丁 37 / 阈值 15 ⇒ `PR_INTENT="blocked"`，不开 PR。
+
+## P38 dashboard 响应压缩（gzip）
+
+- **文件**：`hermes_cli/web_server.py`（CORS 之后追加 `GZipMiddleware`，最外层）
+- **起因**：2026-11-15 trantor 请求 `web_perf_a11y_gates`。dashboard 静态资源 1661KB 裸传、无 `Content-Encoding`；4×CPU + 1.6Mbps 档 LCP 8016ms。
+- **实测**：`/assets/i18n-*.js` 493019B → wire 144600B（−71%）；同一探针三次 LCP 2684/2688/2692ms；`axe` critical/serious 归零（另一处 `button-name` 见 P39 说明）。
+- **为何放最外层**：Starlette onion 后加先跑；压缩需看到最终 body。`GZipMiddleware` 自身跳过 `text/event-stream` 与 `http.response.pathsend`，PTY/SSE 与 `FileResponse` 不受影响；`Cache-Control: immutable` 原样透传。
+- **回滚**：删掉这两行 import + add_middleware 即恢复；备份见 `data/backups/20261115051459/web_server.py`。
+- **不变量**：另有一处 a11y 修补在 `web/src/components/ProfileSwitcher.tsx`（给 `@nous-research/ui` 的 combobox trigger 补 `aria-label`），前端文件不入补丁清单，随 dist 重建生效。

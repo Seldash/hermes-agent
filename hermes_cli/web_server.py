@@ -832,6 +832,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Response compression. The dashboard bundle ships ~1.6 MB of JS/CSS and the
+# static mount sets ``immutable`` caching but no encoding: a throttled mobile
+# profile (4x CPU / 1.6 Mbps) measured LCP 8.0s uncompressed vs 2.5s gzipped.
+# Registered AFTER CORS so it is the outermost middleware (it must see the
+# final body). Starlette's GZipMiddleware already skips ``text/event-stream``
+# and ``http.response.pathsend``, so PTY/SSE streams and file sends are
+# untouched; Cache-Control headers pass through unchanged.
+from starlette.middleware.gzip import GZipMiddleware
+
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
+
 
 # Authenticated-route self-test: one in-process request per minute against a
 # cheap DB-touching route, catching "liveness fine but every authed request 500s".

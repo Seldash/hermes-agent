@@ -37,9 +37,11 @@ python3 scripts/qa/spacing_probe.py http://127.0.0.1:8124/models --viewport 390x
 
 ## a11y 门禁的两个「态」必须显式声明
 
-同一个 dashboard 在**空态**（全新 HERMES_HOME，首启横幅 + 空列表）与**常规态**（已有 profile/会话）下，axe 的违规集合并不相同 —— 所以 `axe_scan.py --state {empty,configured}` 是**必填**参数，不声明态就不给结论（旧的无参调用会直接 argparse 报错，这是故意的）。`--verify-state` 会反查页面确实处于声明的态（例如空态必须看到首启横幅、常规态必须看到会话列表），对不上即 `state_verified != ok` 并 exit 1，防止「拿空态读数冒充常规态」。
+同一个 dashboard 在**空态**（全新 HERMES_HOME，首启横幅 + 空列表）与**常规态**（已有 profile/会话）下，axe 的违规集合并不相同 —— 所以 `axe_scan.py --state {empty,configured}` 是**必填**参数，不声明态就不给结论（旧的无参调用会直接 argparse 报错，这是故意的）。`--verify-state` 用于反查页面是否真处于声明的态，防止「拿空态读数冒充常规态」；**它只对 `/models` 页有效**：探针读该页 i18n `models.noModelsData` 文案（en: `No model usage data for this period`），匹配到判 `empty`、匹配不到判 `configured`。首启横幅与会话列表**不参与**判定。
 
-验收口径：两态各跑一次 `--undersized report --verify-state` 都要 `critical_serious=0`、`state_verified=ok`。
+退出码是**只对 `mismatch` 红**：`state_verified=mismatch` → exit 1；`state_verified=unknown`（非 `/models` 页，无态标记可读）→ **不红，exit 0**。因此 `GATE_URL` 一旦指向非 `/models` 页，`--verify-state` 会静默降级为 `unknown` 并照样给绿 —— 四个 `gate:*` 脚本默认都打 `http://127.0.0.1:8123/models`，不要为测别的页面去改这个默认值；测别的页面只能依赖 axe 读数，不能把态校验算进结论。
+
+验收口径：两态各跑一次 `--undersized report --verify-state`，都要 `critical_serious=0`、`state_verified=ok`。**`ok` 是硬要求，`unknown` 不算通过**——它说明被测页不是 `/models`，态根本没验（尽管退出码为 0）。
 
 ## known-upstream 白名单（fail closed）
 

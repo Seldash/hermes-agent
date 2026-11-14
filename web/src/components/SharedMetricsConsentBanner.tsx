@@ -78,7 +78,14 @@ export function SharedMetricsConsentBanner() {
       role="region"
       aria-label={t.app.sharedMetricsTitle ?? "Help improve Hermes?"}
       data-testid="shared-metrics-consent-banner"
-      className="flex flex-wrap items-center gap-2 border-b border-current/20 bg-current/5 px-4 py-1.5 text-xs text-midground"
+      className={
+        // Mobile: the wrapped banner is ~400px tall, so mounting it after the shell pushed the
+        // whole page down (CLS 0.47 on a fresh profile). Out of flow below lg: it overlays the
+        // bottom of the viewport instead of re-flowing the app, and scrolls inside 45vh.
+        "flex flex-wrap items-center gap-2 border-b border-current/20 bg-current/5 px-4 py-1.5 text-xs text-midground " +
+        "max-lg:fixed max-lg:inset-x-0 max-lg:bottom-0 max-lg:z-40 max-lg:max-h-[45vh] max-lg:overflow-y-auto " +
+        "max-lg:border-t max-lg:bg-background-base max-lg:shadow-lg"
+      }
     >
       <BarChart3 className="h-3.5 w-3.5 shrink-0" />
       <span className="font-semibold">{t.app.sharedMetricsTitle ?? "Help improve Hermes?"}</span>
